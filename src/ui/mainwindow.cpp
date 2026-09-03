@@ -38,6 +38,9 @@
 #include <QUrl>
 #include <QDesktopServices>
 #include <QDate>
+#include <QTextCharFormat>
+#include <QTextCursor>
+#include <QColor>
 #include <QPainter>
 #include <QStackedWidget>
 #include <QtConcurrent>
@@ -80,6 +83,24 @@ public:
         QStyledItemDelegate::paint(painter, opt, index);
     }
 };
+
+// Diff/blame 着色回显：+ 行绿、- 行红、@@ 行蓝（模拟终端 diff 配色）
+void setColoredDiff(QPlainTextEdit *edit, const QString &text) {
+    edit->clear();
+    QTextCursor cur = edit->textCursor();
+    QTextCharFormat add, del, hunk, norm;
+    add.setForeground(QColor("#3fb950"));
+    del.setForeground(QColor("#e5534b"));
+    hunk.setForeground(QColor("#58a6ff"));
+    for (const QString &line : text.split('\n')) {
+        const QTextCharFormat *f = &norm;
+        if (line.startsWith('+')) f = &add;
+        else if (line.startsWith('-')) f = &del;
+        else if (line.startsWith("@@")) f = &hunk;
+        cur.insertText(line + '\n', *f);
+    }
+    edit->setTextCursor(cur);
+}
 
 
 
@@ -262,7 +283,8 @@ void MainWindow::buildMenu() {
     auto &a = m_actions;
 
     a.connectMenu = mb->addMenu(i18n::t("menu.connect"));
-    a.connectMenu->addAction(i18n::t("repo_search_ph"), this, &MainWindow::openRepoPanel);
+    a.connectRepos = a.connectMenu->addAction(i18n::t("repo_search_ph"));
+    connect(a.connectRepos, &QAction::triggered, this, &MainWindow::openRepoPanel);
 
     a.fileMenu = mb->addMenu(i18n::t("menu.file"));
     a.open = a.fileMenu->addAction(i18n::t("menu.open"));
@@ -570,7 +592,7 @@ void MainWindow::buildCentral() {
             if (hash != m_diffHash) return;      // 用户已切换到其他提交
             QString out = w->result();
             if (out.size() > 200000) out = out.left(200000) + "\n... " + i18n::t("truncated");
-            m_diffEdit->setPlainText(out);
+            setColoredDiff(m_diffEdit, out);
         });
         m_diffHash = hash;
         w->setFuture(QtConcurrent::run([repo, hash]() -> QString {
@@ -737,11 +759,13 @@ void MainWindow::startRefresh(bool branches, bool status, bool history, bool gra
         const quint64 gen = ++m_refreshGen;
         auto *w = new QFutureWatcher<RefreshData>(this);
         connect(w, &QFutureWatcher<RefreshData>::finished, this, [this, w, gen, kind] {
+            // 无论结果是否过期都要收遮罩：丢弃旧结果≠不需要收尾，
+            // 否则新任务只刷分支/历史时，旧的 status 任务会把遮罩永远挂住
+            if (kind == QLatin1Char('s')) showLoading(false);
             const RefreshData d = w->result();
             w->deleteLater();
             if (gen != m_refreshGen) return;   // 已有更新的刷新，丢弃过期结果
             applyRefresh(d);
-            if (kind == QLatin1Char('s')) showLoading(false);
         });
         w->setFuture(QtConcurrent::run([this, repo, gen, kind]() -> RefreshData {
             RefreshData d;
@@ -902,7 +926,8 @@ void MainWindow::onFileDoubleClicked(const QString &path) {
         applyImageZoom();
         m_editorStack->setCurrentWidget(m_imageView);
         ensureTab(m_editorHost, 0, i18n::t("editor"));
-        m_detailTabs->setTabText(0, "\U0001F5BC " + path);
+        const int edIdx = m_detailTabs->indexOf(m_editorHost);
+        if (edIdx >= 0) m_detailTabs->setTabText(edIdx, "\U0001F5BC " + path);
         return;
     }
     if (!isText) {
@@ -930,8 +955,9 @@ void MainWindow::runCurrentFile(const QString &path) {
         return;
     }
 
-    // 编辑器里有未保存修改时提醒：可能运行的是旧代码
-    if (m_editorPanel->isModified()) {
+    // 仅当运行的就是编辑器里打开的文件且有未保存修改时才提醒，
+    // 右键运行树上其他文件与编辑器内容无关，不该误报
+    if (file == m_editorPanel->openPath() && m_editorPanel->isModified()) {
         QMessageBox box(this);
         box.setWindowTitle(i18n::t("hint"));
         box.setIcon(QMessageBox::Warning);
@@ -1035,7 +1061,7 @@ void MainWindow::onContextMenu(const QPoint &pos) {
         menu.addAction(i18n::t("view_diff"), this, [this, path] { showDiffForFile(path); });
         menu.addAction(i18n::t("view_blame"), this, [this, path] {
             try {
-                m_diffEdit->setPlainText(git()->blame(m_currentFile, path));
+                setColoredDiff(m_diffEdit, git()->blame(m_currentFile, path));
                 m_detailTabs->setCurrentIndex(1);
             } catch (const std::exception &e) { QMessageBox::critical(this, i18n::t("error"), e.what()); }
         });
@@ -1094,7 +1120,7 @@ void MainWindow::showDiffForFile(const QString &path) {
     auto *w = new QFutureWatcher<QString>(this);
     connect(w, &QFutureWatcher<QString>::finished, this, [this, w] {
         w->deleteLater();
-        m_diffEdit->setPlainText(w->result());
+        setColoredDiff(m_diffEdit, w->result());
     });
     w->setFuture(QtConcurrent::run([repo, path]() -> QString {
         try { return git()->diff(repo, path); }
@@ -1185,14 +1211,31 @@ void MainWindow::commitAndPush() {
 }
 
 void MainWindow::pull() {
+    if (m_currentFile.isEmpty()) return;
     const Account a = acct()->currentAccount();
-    try {
-        git()->pull(m_currentFile, a.token, a.username);
+    const QString repo = m_currentFile;
+    m_statusLabel->setText("⏳ " + i18n::t("pulling"));
+    auto err = std::make_shared<QString>();
+    auto *w = new QFutureWatcher<bool>(this);
+    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err] {
+        w->deleteLater();
+        if (!w->result()) {
+            m_statusLabel->setText("❌ " + i18n::t("pull_failed"));
+            QMessageBox::critical(this, i18n::t("pull_failed"), *err);
+            return;
+        }
         m_statusLabel->setText("✅ " + i18n::t("pull_success"));
         refreshStatus(); refreshHistory();
-    } catch (const std::exception &e) {
-        QMessageBox::critical(this, i18n::t("pull_failed"), e.what());
-    }
+    });
+    w->setFuture(QtConcurrent::run([repo, a, err]() -> bool {
+        try {
+            git()->pull(repo, a.token, a.username);
+            return true;
+        } catch (const std::exception &e) {
+            *err = QString::fromUtf8(e.what());
+            return false;
+        }
+    }));
 }
 
 // 推送入口：后台扫描大文件（不卡 UI），确认后进入 doPush
@@ -1231,16 +1274,20 @@ void MainWindow::doPush() {
     m_pushProcess = new QProcess(this);
     QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
     pe.insert("GIT_TERMINAL_PROMPT", "0");
-    // askpass
+    // askpass：Token 走环境变量（不写脚本明文），对特殊字符也安全
     const QString dir = QDir::tempPath() + "/gitflow_auth";
     QDir().mkpath(dir);
     const QString bat = dir + "/askpass.cmd";
     { QFile f(bat); if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QTextStream ts(&f);
         ts << "@echo off\r\necho %~1 | findstr /I \"Username\" >nul\r\n";
-        ts << "if not errorlevel 1 (echo " << (a.username.isEmpty() ? "oauth2" : a.username) << ")"
-           << " else (echo " << a.token << ")\r\n"; } }
+        ts << "if not errorlevel 1 (echo %GF_USER%) else (echo %GF_TOKEN%)\r\n"; } }
     pe.insert("GIT_ASKPASS", bat);
+    pe.insert("GF_TOKEN", a.token);
+    pe.insert("GF_USER", a.username.isEmpty() ? QStringLiteral("oauth2") : a.username);
+    // 禁用 GCM 交互，避免弹出 GitHub 登录窗口抢走 Token 认证
+    pe.insert("GCM_INTERACTIVE", "Never");
+    pe.insert("GCM_GUI_PROMPT", "Never");
     // 代理
     const QString proxy = proxy::detectSystemProxy();
     if (!proxy.isEmpty()) { pe.insert("HTTPS_PROXY", proxy); pe.insert("HTTP_PROXY", proxy); }
@@ -1261,7 +1308,10 @@ void MainWindow::doPush() {
         if (code == 0) onPushFinished();
         else onPushFailed(QString::fromUtf8(m_pushProcess->readAllStandardError()));
     });
-    m_pushProcess->start(git()->gitPath(), { "-c", "http.version=HTTP/1.1", "push", "--progress" });
+    // credential.helper 置空：强制走 askpass（应用内 Token）；-u 首推自动建立上游跟踪
+    m_pushProcess->start(git()->gitPath(),
+                         { "-c", "http.version=HTTP/1.1", "-c", "credential.helper=",
+                           "push", "-u", "origin", "--progress" });
 }
 
 // ─────────────── push 进度槽 ───────────────
@@ -1273,12 +1323,17 @@ void MainWindow::onPushProgressLine(const QString &line) {
 void MainWindow::onPushFinished() {
     if (m_progressDlg) { m_progressDlg->finishOk(i18n::t("push_success")); m_progressDlg = nullptr; }
     m_statusLabel->setText("\u2705 " + i18n::t("push_success"));
+    // 提交并推送链路：push 完成是最后一环，必须恢复提交按钮，否则永久禁用
+    m_commitBtn->setEnabled(true);
+    m_commitPushBtn->setEnabled(true);
     refreshStatus(); refreshHistory();
 }
 
 void MainWindow::onPushFailed(const QString &err) {
     if (m_progressDlg) { m_progressDlg->finishFail(err, GitService::diagnoseNetwork()); m_progressDlg = nullptr; }
     m_statusLabel->setText("\u274c " + i18n::t("push_failed"));
+    m_commitBtn->setEnabled(true);
+    m_commitPushBtn->setEnabled(true);
 }
 
 void MainWindow::deleteSelectedFile() {
@@ -1359,7 +1414,25 @@ void MainWindow::createTagDialog() {
 
 void MainWindow::showTagList() {
     const QStringList tags = git()->tags(m_currentFile);
-    QMessageBox::information(this, i18n::t("tag_list_t"), tags.join('\n'));
+    QDialog d(this);
+    d.setWindowTitle(i18n::t("tag_list_t"));
+    d.setMinimumSize(420, 360);
+    auto *v = new QVBoxLayout(&d);
+    auto *lbl = new QLabel(tags.isEmpty() ? i18n::t("no_results")
+                                          : QStringLiteral("%1: %2").arg(i18n::t("tag_list_t")).arg(tags.size()));
+    lbl->setStyleSheet(QString("color:%1;").arg(theme::textMuted()));
+    v->addWidget(lbl);
+    auto *list = new QListWidget;
+    list->setFont(QFont("Consolas", 10));
+    if (tags.isEmpty())
+        list->addItem(i18n::t("no_results"));
+    else
+        list->addItems(tags);
+    v->addWidget(list, 1);
+    auto *closeBtn = new QPushButton(i18n::t("close"));
+    connect(closeBtn, &QPushButton::clicked, &d, &QDialog::accept);
+    v->addWidget(closeBtn, 0, Qt::AlignRight);
+    d.exec();
 }
 
 void MainWindow::revertToCommit() {
@@ -1368,8 +1441,15 @@ void MainWindow::revertToCommit() {
     const QVariantMap m = item->data(Qt::UserRole).toMap();
     const QString hash = m.value("hash").toString();
     if (hash.isEmpty()) return;
-    if (QMessageBox::question(this, i18n::t("revert_here"),
-                              i18n::t("reset_hard_confirm")) != QMessageBox::Yes) return;
+    // 硬重置危险操作：红色富文本警告（后果逐条列出）+ 默认按钮为"否"
+    QMessageBox box(this);
+    box.setWindowTitle(i18n::t("revert_here"));
+    box.setIcon(QMessageBox::Warning);
+    box.setTextFormat(Qt::RichText);
+    box.setText(i18n::t("reset_hard_confirm").arg(hash.left(10)));
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
     try {
         git()->resetTo(m_currentFile, hash, true);
         refreshStatus(); refreshHistory();
@@ -1437,20 +1517,67 @@ void MainWindow::showLoading(bool on) {
     }
 }
 
-// 拖拽文件夹到窗口直接打开项目
+// 拖拽：文件夹 = 打开项目；文件 = 复制进当前仓库并暂存（配合提交按钮）
 void MainWindow::dragEnterEvent(QDragEnterEvent *e) {
-    if (e->mimeData()->hasUrls() && QFileInfo(e->mimeData()->urls().first().toLocalFile()).isDir()) {
-        e->acceptProposedAction();
-        m_statusLabel->setText("\U0001F4C2 " + e->mimeData()->urls().first().toLocalFile());
+    if (!e->mimeData()->hasUrls()) return;
+    for (const QUrl &u : e->mimeData()->urls()) {
+        const QFileInfo fi(u.toLocalFile());
+        if (fi.isDir() || fi.isFile()) {
+            e->acceptProposedAction();
+            m_statusLabel->setText("\U0001F4C2 " + i18n::t("drag_drop_hint"));
+            return;
+        }
     }
 }
 
 void MainWindow::dropEvent(QDropEvent *e) {
     if (!e->mimeData()->hasUrls()) return;
-    const QString dir = e->mimeData()->urls().first().toLocalFile();
-    if (QFileInfo(dir).isDir()) {
-        e->acceptProposedAction();
-        openRepo(dir);
+    QStringList dirs, files;
+    for (const QUrl &u : e->mimeData()->urls()) {
+        const QString local = u.toLocalFile();
+        if (local.isEmpty()) continue;
+        if (QFileInfo(local).isDir()) dirs << local;
+        else files << local;
+    }
+    e->acceptProposedAction();
+    if (files.isEmpty() && !dirs.isEmpty()) { openRepo(dirs.first()); return; }
+    if (files.isEmpty()) return;
+
+    if (m_currentFile.isEmpty()) {
+        QMessageBox::information(this, i18n::t("hint"), i18n::t("no_project"));
+        return;
+    }
+    // 仓库内文件直接暂存；仓库外的复制进仓库根目录后暂存
+    const QDir root(m_currentFile);
+    const QString rootAbs = root.absolutePath() + '/';
+    QStringList staged, skipped;
+    for (const QString &f : files) {
+        const QFileInfo fi(f);
+        QString rel;
+        if (fi.absoluteFilePath().startsWith(rootAbs)) {
+            rel = root.relativeFilePath(fi.absoluteFilePath());
+        } else {
+            const QString dest = root.filePath(fi.fileName());
+            if (QFileInfo::exists(dest)) { skipped << fi.fileName(); continue; }
+            if (!QFile::copy(f, dest)) { skipped << fi.fileName(); continue; }
+            rel = fi.fileName();
+        }
+        if (!rel.isEmpty() && rel != ".") staged << rel;
+    }
+    if (staged.isEmpty()) {
+        m_statusLabel->setText("⚠ " + i18n::t("dropped_none"));
+        return;
+    }
+    try {
+        git()->add(m_currentFile, staged);
+        refreshStatus();
+        QString msg = i18n::t("dropped_staged").arg(staged.size());
+        if (!skipped.isEmpty())
+            msg += QStringLiteral("  (%1: %2)").arg(i18n::t("dropped_skipped"),
+                                                    skipped.join(", "));
+        m_statusLabel->setText("✅ " + msg);
+    } catch (const std::exception &ex) {
+        QMessageBox::critical(this, i18n::t("error"), ex.what());
     }
 }
 
@@ -1694,6 +1821,7 @@ void MainWindow::showAbout() {
 void MainWindow::retranslateUi() {
     auto &a = m_actions;
     a.connectMenu->setTitle(i18n::t("menu.connect"));
+    a.connectRepos->setText(i18n::t("repo_search_ph"));
     a.fileMenu->setTitle(i18n::t("menu.file"));
     a.open->setText(i18n::t("menu.open"));
     a.init->setText(i18n::t("menu.init"));
@@ -1740,5 +1868,6 @@ void MainWindow::retranslateUi() {
     if (m_repoNameLabel->text().startsWith("\U0001F4C1") == false)
         m_repoNameLabel->setText(i18n::t("no_project"));
     m_statusLabel->setText(i18n::t("ready"));
+    if (m_terminal) m_terminal->retranslate();
     updateConnectTitle();   // 语言切换后刷新账户区（含 Token 倒计时文案）
 }

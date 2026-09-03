@@ -15,7 +15,8 @@ public:
     void createRepo(const QString &name, const QString &desc, bool privateRepo,
                     bool autoInit, const Callback &cb);
     void createRelease(const QString &owner, const QString &repo, const QString &tag,
-                       const QString &name, const QString &body, bool prerelease, const Callback &cb);
+                       const QString &name, const QString &body, bool prerelease,
+                       const Callback &cb, const QString &targetCommitish = {});
     void uploadAsset(const QString &owner, const QString &repo, qint64 releaseId,
                      const QString &filePath, const Callback &cb);
 };

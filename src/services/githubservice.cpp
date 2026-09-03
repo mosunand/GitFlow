@@ -9,6 +9,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QUrlQuery>
+#include <QHttpMultiPart>
+#include <QHttpPart>
 #include <QFile>
 
 namespace {
@@ -28,19 +30,16 @@ void applyAuth(QNetworkRequest &req, const QString &token, int timeoutMs = 30000
 QString apiError(QNetworkReply *reply, const QByteArray &data) {
     if (reply->error() == QNetworkReply::NoError) return {};
     const QJsonObject o = QJsonDocument::fromJson(data).object();
+    // GitHub 用 {"message": "..."}，Gitee 校验失败用 {"messages": ["...", ...]}
     const QString msg = o.value("message").toString();
-    if (msg.isEmpty()) return reply->errorString();
-    const QJsonArray errors = o.value("errors").toArray();
-    if (errors.isEmpty()) return msg;
-    QStringList extra;
-    for (const auto &e : errors) {
-        const QJsonObject eo = e.toObject();
-        const QString code = eo.value("code").toString();
-        const QString em = eo.value("message").toString();
-        extra << (code.isEmpty() ? em : code + ": " + em);
+    if (!msg.isEmpty()) return msg;
+    const QJsonArray msgs = o.value("messages").toArray();
+    if (!msgs.isEmpty()) {
+        QStringList list;
+        for (const auto &m : msgs) list << m.toString();
+        return list.join("; ");
     }
-    extra.removeAll(QString());
-    return extra.isEmpty() ? msg : msg + " (" + extra.join("; ") + ")";
+    return reply->errorString();
 }
 
 void finishReply(QNetworkReply *reply, const RestService::Callback &cb) {
@@ -90,6 +89,22 @@ void RestService::post(const QString &path, const QJsonObject &body, const Callb
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     applyAuth(req, m_token);
     QNetworkReply *reply = m_nam->post(req, QJsonDocument(body).toJson());
+    connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
+}
+
+void RestService::postForm(const QString &path, const QUrlQuery &form, const Callback &cb) {
+    QNetworkRequest req(QUrl(m_baseUrl + path));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/x-www-form-urlencoded");
+    applyAuth(req, m_token);
+    QNetworkReply *reply = m_nam->post(req, form.toString(QUrl::FullyEncoded).toUtf8());
+    connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
+}
+
+void RestService::postMultipart(const QUrl &url, QHttpMultiPart *multi, const Callback &cb) {
+    QNetworkRequest req(url);
+    applyAuth(req, m_token, 300000);   // 上传给更长超时
+    QNetworkReply *reply = m_nam->post(req, multi);
+    multi->setParent(reply);           // 随 reply 一起释放
     connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
 }
 

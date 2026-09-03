@@ -6,6 +6,7 @@
 
 class QNetworkAccessManager;
 class QNetworkReply;
+class QHttpMultiPart;
 
 // GitHub / Gitee REST API 基类：自动继承系统代理
 class RestService : public QObject {
@@ -19,6 +20,10 @@ public:
 
     void get(const QString &path, const Callback &cb, const QUrlQuery &query = {});
     void post(const QString &path, const QJsonObject &body, const Callback &cb);
+    // Gitee 等表单协议接口：application/x-www-form-urlencoded
+    void postForm(const QString &path, const QUrlQuery &form, const Callback &cb);
+    // 附件上传：multipart/form-data（Gitee attach_files 要求）
+    void postMultipart(const QUrl &url, QHttpMultiPart *multi, const Callback &cb);
     void postRaw(const QUrl &url, const QByteArray &data, const QString &contentType, const Callback &cb);
 
 protected:

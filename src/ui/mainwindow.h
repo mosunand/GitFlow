@@ -153,6 +153,7 @@ private:
     TerminalPanel *m_terminal = nullptr;
     struct MenuActions {
         QMenu *connectMenu = nullptr, *fileMenu = nullptr, *gitMenu = nullptr, *helpMenu = nullptr;
+        QAction *connectRepos = nullptr;
         QAction *open = nullptr, *init = nullptr, *quit = nullptr, *searchRepo = nullptr,
             *pull = nullptr, *push = nullptr, *stashSave = nullptr, *stashPop = nullptr,
             *stashList = nullptr, *tagCreate = nullptr, *tagList = nullptr, *grep = nullptr,

@@ -11,11 +11,13 @@ class TerminalPanel : public QWidget {
     Q_OBJECT
 public:
     explicit TerminalPanel(QWidget *parent = nullptr);
+    ~TerminalPanel() override;
 
     void setGitPath(const QString &gitPath);
     void setRepo(const QString &path);      // 打开项目时同步工作目录
     void setBranch(const QString &branch);  // 分支变化时同步提示符
     void runCommandText(const QString &cmd); // 外部注入命令执行（编辑器"运行"）
+    void retranslate();                      // 语言切换后刷新占位文案
 
 private slots:
     void runCommand();

@@ -56,7 +56,7 @@ TerminalPanel::TerminalPanel(QWidget *parent) : QWidget(parent) {
 
     m_in = new QLineEdit;
     m_in->setFont(QFont("Consolas", 10));
-    m_in->setPlaceholderText(QStringLiteral("git status / ls / cd ..  (Enter 执行)"));
+    m_in->setPlaceholderText(i18n::t("terminal_placeholder"));
     m_in->setStyleSheet(QString(
         "QLineEdit{background-color:%1;color:%2;border:1px solid %3;border-radius:6px;padding:4px 8px;"
         "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
@@ -66,6 +66,19 @@ TerminalPanel::TerminalPanel(QWidget *parent) : QWidget(parent) {
     layout->addWidget(m_in);
 
     updatePrompt();
+}
+
+TerminalPanel::~TerminalPanel() {
+    // 面板销毁时终止在跑的命令，避免孤儿 bash/解释器进程残留
+    if (m_proc) {
+        m_proc->kill();
+        m_proc->deleteLater();
+        m_proc = nullptr;
+    }
+}
+
+void TerminalPanel::retranslate() {
+    m_in->setPlaceholderText(i18n::t("terminal_placeholder"));
 }
 
 void TerminalPanel::setGitPath(const QString &gitPath) {

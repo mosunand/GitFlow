@@ -1,6 +1,7 @@
 #include "gitservice.h"
 #include "proxy.h"
 #include <QProcess>
+#include <QElapsedTimer>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QFileInfo>
@@ -57,7 +58,9 @@ void appendProxyEnv(QProcessEnvironment &pe) {
     }
 }
 
-// 写 askpass 批处理并返回路径（Windows）
+// 写 askpass 批处理并返回路径（Windows）。
+// Token 走 GF_TOKEN 环境变量（只对本 git 子进程可见），不写进脚本文件明文；
+// 用户名/Token 含 & | ^ < > 等 cmd 特殊字符时也不会破坏批处理语法。
 QString writeAskpass(const QString &token, const QString &user) {
     const QString dir = QDir::tempPath() + "/gitflow_auth";
     QDir().mkpath(dir);
@@ -67,10 +70,22 @@ QString writeAskpass(const QString &token, const QString &user) {
         QTextStream ts(&f);
         ts << "@echo off\r\n";
         ts << "echo %~1 | findstr /I \"Username\" >nul\r\n";
-        ts << "if not errorlevel 1 (echo " << (user.isEmpty() ? "oauth2" : user) << ")"
-           << " else (echo " << token << ")\r\n";
+        ts << "if not errorlevel 1 (echo %GF_USER%) else (echo %GF_TOKEN%)\r\n";
     }
     return batPath;
+}
+
+// 带一次性 Token 环境的 git 启动封装：所有远程认证统一走这里
+QProcessEnvironment askpassEnv(const QString &token, const QString &user) {
+    QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
+    pe.insert("GIT_TERMINAL_PROMPT", "0");
+    pe.insert("GCM_INTERACTIVE", "Never");
+    pe.insert("GCM_GUI_PROMPT", "Never");
+    pe.insert("GF_TOKEN", token);
+    pe.insert("GF_USER", user.isEmpty() ? QStringLiteral("oauth2") : user);
+    pe.insert("GIT_ASKPASS", writeAskpass(token, user));
+    appendProxyEnv(pe);
+    return pe;
 }
 } // namespace
 
@@ -85,8 +100,11 @@ QString GitService::run(const QStringList &args, const QString &cwd, bool check)
     proc.start(m_gitPath, args);
     if (!proc.waitForStarted(5000))
         throw std::runtime_error("Cannot start git process");
-    if (!proc.waitForFinished(-1))
+    // 超时兜底：git 挂死时不能让 UI 的加载遮罩永远转下去
+    if (!proc.waitForFinished(120000)) {
+        proc.kill();
         throw std::runtime_error("Git operation timed out");
+    }
     const QString out = QString::fromUtf8(proc.readAllStandardOutput());
     const QString err = QString::fromUtf8(proc.readAllStandardError());
     if (check && (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0)) {
@@ -318,20 +336,19 @@ QList<CommitInfo> GitService::history(const QString &repo, int limit) {
 void GitService::push(const QString &repo, const QString &token, const QString &user,
                       const LineFn &onLine, const LineFn &onDone, bool *okOut, QString *errOut) {
     QProcess proc;
-    QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
-    pe.insert("GIT_TERMINAL_PROMPT", "0");
-    pe.insert("GCM_INTERACTIVE", "Never");
-    pe.insert("GIT_ASKPASS", writeAskpass(token, user));
-    appendProxyEnv(pe);
-    proc.setProcessEnvironment(pe);
+    proc.setProcessEnvironment(askpassEnv(token, user));
     proc.setWorkingDirectory(repo);
-    proc.start(m_gitPath, { "-c", "http.version=HTTP/1.1", "push", "--progress" });
+    // credential.helper 置空：强制走 askpass（Token），不让 GCM 弹登录窗
+    proc.start(m_gitPath, { "-c", "http.version=HTTP/1.1", "-c", "credential.helper=", "push", "--progress" });
     if (!proc.waitForStarted(5000)) {
         if (okOut) *okOut = false;
         if (errOut) *errOut = QStringLiteral("cannot start git");
         return;
     }
     QString all;
+    // 有总超时：git 挂死（如网络黑洞）不能永远占用进度弹窗
+    QElapsedTimer elapsed;
+    elapsed.start();
     while (proc.state() != QProcess::NotRunning) {
         if (proc.waitForReadyRead(300)) {
             const QByteArray chunk = proc.readAll();
@@ -339,6 +356,12 @@ void GitService::push(const QString &repo, const QString &token, const QString &
             if (onLine)
                 for (const QString &line : QString::fromUtf8(chunk).split('\n', Qt::SkipEmptyParts))
                     onLine(line.trimmed());
+        }
+        if (elapsed.elapsed() > 1800000) {   // 30 分钟总闸
+            proc.kill();
+            if (errOut) *errOut = all + "\n[timeout: push aborted after 30min]";
+            if (okOut) *okOut = false;
+            return;
         }
     }
     const bool success = proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0;
@@ -350,13 +373,9 @@ void GitService::push(const QString &repo, const QString &token, const QString &
 void GitService::pull(const QString &repo, const QString &token, const QString &user) {
     if (!token.isEmpty()) {
         QProcess proc;
-        QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
-        pe.insert("GIT_TERMINAL_PROMPT", "0");
-        pe.insert("GIT_ASKPASS", writeAskpass(token, user));
-        appendProxyEnv(pe);
-        proc.setProcessEnvironment(pe);
+        proc.setProcessEnvironment(askpassEnv(token, user));
         proc.setWorkingDirectory(repo);
-        proc.start(m_gitPath, { "pull", "--ff-only" });
+        proc.start(m_gitPath, { "-c", "credential.helper=", "pull", "--ff-only" });
         proc.waitForFinished(-1);
         if (proc.exitCode() != 0)
             throw std::runtime_error(QString::fromUtf8(proc.readAllStandardError()).toStdString());
@@ -368,22 +387,29 @@ void GitService::pull(const QString &repo, const QString &token, const QString &
 QString GitService::clone(const QString &url, const QString &targetDir,
                           const QString &token, const QString &user, const QString &into) {
     QDir().mkpath(targetDir);
-    QStringList args { "clone", url };
-    if (!into.isEmpty()) args << into;
     if (!token.isEmpty()) {
+        // credential.helper 置空：强制走 askpass（Token），不让 GCM 弹登录窗
+        QStringList args { "-c", "credential.helper=", "clone", url };
+        if (!into.isEmpty()) args << into;
         QProcess proc;
-        QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
-        pe.insert("GIT_TERMINAL_PROMPT", "0");
-        pe.insert("GIT_ASKPASS", writeAskpass(token, user));
-        appendProxyEnv(pe);
-        proc.setProcessEnvironment(pe);
+        proc.setProcessEnvironment(askpassEnv(token, user));
         proc.setWorkingDirectory(targetDir);
         proc.start(m_gitPath, args);
         proc.waitForFinished(-1);
         if (proc.exitCode() != 0)
             throw std::runtime_error(QString::fromUtf8(proc.readAllStandardError()).toStdString());
     } else {
-        run(args, targetDir);
+        // 无 Token 的公开仓库克隆：大仓库耗时长，走无超时路径（由 UI 的 WaitCursor 兜底）
+        QProcess proc;
+        proc.setProcessEnvironment(gitEnv());
+        proc.setWorkingDirectory(targetDir);
+        proc.start(m_gitPath, { "clone", url });
+        if (!proc.waitForStarted(5000))
+            throw std::runtime_error("Cannot start git process");
+        if (!proc.waitForFinished(-1))
+            throw std::runtime_error("Git operation timed out");
+        if (proc.exitCode() != 0)
+            throw std::runtime_error(QString::fromUtf8(proc.readAllStandardError()).toStdString());
     }
     if (!into.isEmpty()) return into;
     QString name = url.trimmed().chopped(1);

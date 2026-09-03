@@ -6,7 +6,7 @@
 
 namespace theme {
 namespace {
-QString g_theme = QStringLiteral("dark");
+QString g_theme = QStringLiteral("light");
 
 struct Palette {
     const char *bg, *bgSurface, *bgElevated, *bgTab, *bgHover, *bgButton,

@@ -168,16 +168,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
     outer->addWidget(scroll, 1);
     outer->addLayout(bottom);
 
-    // 初始值：输入框默认空白（不预填本机信息）；当前全局身份仅作灰色提示
-    const auto id = gitSvc()->identity(QString());
-    if (!id.first.isEmpty() || !id.second.isEmpty()) {
-        auto *curAuthor = new QLabel(i18n::t("author_current_hint")
-            .arg(id.first.isEmpty() ? QStringLiteral("—") : id.first,
-                 id.second.isEmpty() ? QStringLiteral("—") : id.second));
-        curAuthor->setStyleSheet(QString("color:%1;font-size:11px;").arg(theme::textMuted()));
-        curAuthor->setWordWrap(true);
-        al2->addWidget(curAuthor);
-    }
+    // 初始值：输入框永远空白，不回显本机任何身份信息（避免误解为打包了个人信息）
     loadAccounts();
     const QString cur = QString::fromLatin1("git");
     detectGit();
@@ -209,7 +200,8 @@ void SettingsDialog::detectGit() {
     }
     // 用 git --version 直接探测 PATH 与常见位置
     static const char *kCandidates[] = {
-        "git", "C:/Program Files/Git/cmd/git.exe", "D:/Tools/Gitbash/Git/cmd/git.exe",
+        "git", "C:/Program Files/Git/cmd/git.exe", "D:/Program Files/Git/cmd/git.exe",
+        "C:/Program Files (x86)/Git/cmd/git.exe",
     };
     for (const char *c : kCandidates) {
         QProcess p;

@@ -34,7 +34,7 @@ void setGitPath(const QString &v) { set("git_path", v); }
 QString storageRoot() { return get("storage_root", "D:/GitFlow"); }
 void setStorageRoot(const QString &v) { set("storage_root", v); }
 
-QString theme() { return get("theme", "dark"); }
+QString theme() { return get("theme", "light"); }
 void setTheme(const QString &v) { set("theme", v); }
 
 QString language() { return get("language", "zh"); }

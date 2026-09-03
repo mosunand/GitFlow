@@ -19,6 +19,11 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QJsonObject>
+#include <QMessageBox>
+#include <QDirIterator>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
 
 namespace {
 AccountService *acct() { static AccountService s; return &s; }
@@ -31,6 +36,7 @@ ReleaseDialog::ReleaseDialog(const QString &owner, const QString &repo,
     setWindowTitle(i18n::t("create_release"));
     setMinimumSize(720, 640);
     resize(760, 680);
+    setAcceptDrops(true);   // 附件支持直接拖拽进来
 
     m_gh = acct()->github();
     m_gitee = acct()->gitee();
@@ -103,7 +109,10 @@ ReleaseDialog::ReleaseDialog(const QString &owner, const QString &repo,
     m_bodyEdit->setMinimumHeight(160);
     layout->addWidget(m_bodyEdit, 1);
 
-    auto *assetCap = new QLabel(i18n::t("upload_assets"));
+    auto *assetCap = new QLabel(i18n::t("upload_assets") + QStringLiteral("  ")
+                                + QStringLiteral("<span style='color:%1;font-size:11px;'>%2</span>")
+                                      .arg(theme::textMuted(), i18n::t("assets_tip")));
+    assetCap->setTextFormat(Qt::RichText);
     assetCap->setStyleSheet(QString("font-weight:bold;color:%1;").arg(theme::text()));
     layout->addWidget(assetCap);
     m_assetList = new QListWidget;
@@ -139,16 +148,37 @@ ReleaseDialog::ReleaseDialog(const QString &owner, const QString &repo,
 
 void ReleaseDialog::chooseAssets() {
     const QStringList files = QFileDialog::getOpenFileNames(this, i18n::t("choose_assets"));
-    for (const QString &f : files) {
-        bool exists = false;
-        for (int i = 0; i < m_assetList->count(); ++i)
-            if (m_assetList->item(i)->data(Qt::UserRole).toString() == f) { exists = true; break; }
-        if (exists) continue;
-        const QFileInfo fi(f);
-        auto *it = new QListWidgetItem(QStringLiteral("%1  (%2 KB)").arg(fi.fileName()).arg(fi.size() / 1024));
-        it->setData(Qt::UserRole, f);
-        m_assetList->addItem(it);
+    for (const QString &f : files) addAssetFile(f);
+}
+
+void ReleaseDialog::addAssetFile(const QString &path) {
+    if (path.isEmpty()) return;
+    const QFileInfo fi(path);
+    if (fi.isDir()) {
+        // 拖文件夹：展开为里面全部文件（含子目录，跳过空目录）
+        QDirIterator it(path, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) addAssetFile(it.next());
+        return;
     }
+    if (!fi.isFile()) return;
+    for (int i = 0; i < m_assetList->count(); ++i)
+        if (m_assetList->item(i)->data(Qt::UserRole).toString() == path) return;   // 去重
+    auto *it2 = new QListWidgetItem(QStringLiteral("%1  (%2 KB)").arg(fi.fileName()).arg(fi.size() / 1024));
+    it2->setData(Qt::UserRole, path);
+    m_assetList->addItem(it2);
+}
+
+// 附件支持拖拽：松开即加入列表，免去一层层翻目录
+void ReleaseDialog::dragEnterEvent(QDragEnterEvent *e) {
+    if (e->mimeData()->hasUrls() && !e->mimeData()->urls().isEmpty() && m_publishBtn->isEnabled())
+        e->acceptProposedAction();
+}
+
+void ReleaseDialog::dropEvent(QDropEvent *e) {
+    if (!m_publishBtn->isEnabled()) return;
+    for (const QUrl &u : e->mimeData()->urls())
+        addAssetFile(u.toLocalFile());
+    e->acceptProposedAction();
 }
 
 void ReleaseDialog::removeSelectedAsset() {
@@ -175,6 +205,46 @@ void ReleaseDialog::publish() {
         m_status->setStyleSheet(QStringLiteral("color:#f85149;"));
         return;
     }
+    setBusy(true);
+    m_status->setText(i18n::t("creating"));
+    m_status->setStyleSheet(QString("color:%1;").arg(theme::accent()));
+
+    // 先取仓库默认分支（Gitee 创建 Release 必传 target_commitish），再预检 Tag
+    QPointer<ReleaseDialog> self(this);
+    RestService *svc = m_platform == QLatin1String("gitee")
+        ? static_cast<RestService *>(m_gitee)
+        : static_cast<RestService *>(m_gh);
+    svc->get(QStringLiteral("/repos/%1/%2").arg(m_owner, m_repo),
+             [self](bool, const QJsonArray &, const QJsonObject &obj, const QString &) {
+        if (!self) return;
+        self->m_targetBranch = obj.value("default_branch").toString(QStringLiteral("master"));
+        self->precheckReleases();
+    });
+}
+
+void ReleaseDialog::precheckReleases() {
+    // 查询该 Tag 是否已有 Release："Tag 已存在"是发布失败最常见情形，
+    // Gitee 对此只回 400 不说明原因，提前查清楚给用户明确提示
+    const QString tag = m_tagEdit->text().trimmed();
+    QPointer<ReleaseDialog> self(this);
+    RestService *listSvc = m_platform == QLatin1String("gitee")
+        ? static_cast<RestService *>(m_gitee)
+        : static_cast<RestService *>(m_gh);
+    listSvc->get(QStringLiteral("/repos/%1/%2/releases").arg(m_owner, m_repo),
+                 [self, tag](bool, const QJsonArray &arr, const QJsonObject &, const QString &) {
+        if (!self) return;
+        for (const auto &v : arr)
+            if (v.toObject().value("tag_name").toString() == tag) {
+                self->setBusy(false);
+                self->finishErr(i18n::t("tag_exists_msg").arg(tag));
+                return;
+            }
+        self->doCreate();
+    });
+}
+
+void ReleaseDialog::doCreate() {
+    const QString tag = m_tagEdit->text().trimmed();
     QString title = m_titleEdit->text().trimmed();
     if (title.isEmpty()) title = tag;
     const QString body = m_bodyEdit->toPlainText();
@@ -184,10 +254,6 @@ void ReleaseDialog::publish() {
     for (int i = 0; i < m_assetList->count(); ++i)
         m_pendingAssets << m_assetList->item(i)->data(Qt::UserRole).toString();
     m_uploadIdx = 0;
-
-    setBusy(true);
-    m_status->setText(i18n::t("creating"));
-    m_status->setStyleSheet(QString("color:%1;").arg(theme::accent()));
 
     QPointer<ReleaseDialog> self(this);
     auto done = [self](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
@@ -205,7 +271,7 @@ void ReleaseDialog::publish() {
     };
 
     if (m_platform == QLatin1String("gitee"))
-        m_gitee->createRelease(m_owner, m_repo, tag, title, body, prerelease, done);
+        m_gitee->createRelease(m_owner, m_repo, tag, title, body, prerelease, done, m_targetBranch);
     else
         m_gh->createRelease(m_owner, m_repo, tag, title, body, prerelease, done);
 }
@@ -239,7 +305,20 @@ void ReleaseDialog::finishOk(const QString &htmlUrl) {
     setBusy(false);
     m_status->setText("✅ " + i18n::t("release_created") + "  " + htmlUrl);
     m_status->setStyleSheet(QStringLiteral("color:#2ea043;"));
-    if (!htmlUrl.isEmpty())
+    // 成功必须弹窗告知并等用户确认：直接关窗+开浏览器太快，用户毫无感知
+    QMessageBox box(this);
+    box.setWindowTitle(i18n::t("create_release"));
+    box.setIcon(QMessageBox::Information);
+    box.setTextFormat(Qt::RichText);
+    box.setText(QStringLiteral("✅ <b>%1</b>%2")
+                    .arg(i18n::t("release_created"),
+                         htmlUrl.isEmpty() ? QString()
+                                           : QStringLiteral("<br><a href='%1'>%1</a>").arg(htmlUrl)));
+    box.setStandardButtons(QMessageBox::Open | QMessageBox::Close);
+    box.button(QMessageBox::Open)->setText(i18n::t("open_browser"));
+    box.button(QMessageBox::Close)->setText(i18n::t("close"));
+    const bool openNow = box.exec() == QMessageBox::Open;
+    if (openNow && !htmlUrl.isEmpty())
         QDesktopServices::openUrl(QUrl(htmlUrl));
     accept();
 }
@@ -253,6 +332,9 @@ void ReleaseDialog::finishErr(const QString &err) {
     else if (err.contains(QLatin1String("Not Found"), Qt::CaseInsensitive)
              || err.contains(QStringLiteral("404")))
         msg = i18n::t("repo_404_msg");
+    else if (err.contains(QLatin1String("Bad Request"), Qt::CaseInsensitive)
+             || err == QLatin1String("400"))
+        msg = i18n::t("release_bad_request");
     m_status->setText("❌ " + i18n::t("release_failed") + ": " + msg);
     m_status->setStyleSheet(QStringLiteral("color:#f85149;"));
 }

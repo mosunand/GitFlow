@@ -22,6 +22,7 @@
 #include <QDesktopServices>
 #include <QApplication>
 #include <QPointer>
+#include <QRadioButton>
 
 namespace {
 AccountService *acct() { static AccountService s; return &s; }
@@ -243,6 +244,7 @@ void RepoPanelDialog::startClone(const QString &url, const QString &name) {
         emit repoCloned(path);
     } catch (const std::exception &e) {
         QApplication::restoreOverrideCursor();
+        m_status->setText("❌ " + i18n::t("clone_failed") + ": " + e.what());
         QMessageBox::warning(this, i18n::t("clone_failed"), e.what());
     }
 }
@@ -285,17 +287,49 @@ void RepoPanelDialog::openInBrowser() {
 }
 
 void RepoPanelDialog::createRepo() {
-    bool ok = false;
-    const QString name = QInputDialog::getText(this, i18n::t("create_repo_btn"),
-                                               i18n::t("repo_name_label"), QLineEdit::Normal, {}, &ok);
-    if (!ok || name.trimmed().isEmpty()) return;
+    // 自建对话框：仓库名 + 公开/私有（QInputDialog 放不下单选）
+    QDialog dlg(this);
+    dlg.setWindowTitle(i18n::t("create_repo_btn"));
+    dlg.setMinimumWidth(440);
+    auto *v = new QVBoxLayout(&dlg);
+    v->setSpacing(10);
+    auto *nameLbl = new QLabel(i18n::t("repo_name_label"));
+    v->addWidget(nameLbl);
+    auto *nameEdit = new QLineEdit;
+    nameEdit->setPlaceholderText(QStringLiteral("my-new-repo"));
+    nameEdit->setMinimumHeight(32);
+    v->addWidget(nameEdit);
+    auto *visLbl = new QLabel(i18n::t("repo_visibility"));
+    v->addWidget(visLbl);
+    auto *pub = new QRadioButton(i18n::t("repo_public"));
+    auto *priv = new QRadioButton(i18n::t("repo_private"));
+    pub->setChecked(true);
+    v->addWidget(pub);
+    v->addWidget(priv);
+    auto *row = new QHBoxLayout;
+    row->addStretch(1);
+    auto *cancel = new QPushButton(i18n::t("cancel"));
+    auto *ok = new QPushButton(i18n::t("create_repo_btn"));
+    ok->setDefault(true);
+    row->addWidget(cancel);
+    row->addWidget(ok);
+    v->addLayout(row);
+    connect(ok, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString name = nameEdit->text().trimmed();
+    if (name.isEmpty()) { QMessageBox::warning(this, i18n::t("hint"), i18n::t("enter_repo_name")); return; }
+
     const Account a = acct()->currentAccount();
-    RestService *svc = a.platform == "gitee"
+    if (a.token.isEmpty()) { m_status->setText("❌ " + i18n::t("no_account_hint")); return; }
+    RestService *svc = a.platform == QLatin1String("gitee")
         ? static_cast<RestService *>(m_gitee)
         : static_cast<RestService *>(m_gh);
     QJsonObject body;
-    body.insert("name", name.trimmed());
+    body.insert("name", name);
     body.insert("auto_init", true);
+    body.insert("private", priv->isChecked());
+
     QPointer<RepoPanelDialog> self(this);
     svc->post("/user/repos", body,
               [self, name](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
@@ -304,9 +338,16 @@ void RepoPanelDialog::createRepo() {
             QMessageBox::warning(self, i18n::t("create_failed"), err);
             return;
         }
-        const QString cloneUrl = obj.value("clone_url").toString();
-        self->m_status->setText("✅ " + name + " — " + cloneUrl);
-        self->startClone(cloneUrl, name);
+        // GitHub 返回 clone_url；Gitee 只有 html_url（补 .git），为空则误报失败
+        QString url = obj.value("clone_url").toString();
+        if (url.isEmpty()) url = obj.value("html_url").toString();
+        if (url.isEmpty()) {
+            self->m_status->setText("✅ " + name + " — " + i18n::t("saved_as_current"));
+            return;
+        }
+        if (!url.endsWith(QLatin1String(".git"))) url += QLatin1String(".git");
+        self->m_status->setText("✅ " + name + " — " + url);
+        self->startClone(url, name);
     });
 }
 
