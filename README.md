@@ -35,7 +35,7 @@ GitFlow Pro 用 **C++17 + Qt 6** 打造：单进程、免安装、启动秒开�
 | 文件 | 说明 |
 |------|------|
 | `GitFlowPro-Setup-v1.0.0.exe` | 安装包（推荐，中文向导，免管理员权限） |
-| `GitFlowPro-v1.0.0-Windows.zip` | 便携版，解压即用 |
+| `GitFlowPro-v3.0-Windows.zip` | 便携版，解压即用 |
 | `GitFlow-1.0.0-Source.zip` | 源码包（含构建说明） |
 
 > 📖 **完整使用文档**（20 章：从安装到 Release 发布、FAQ、注意事项）见 [docs/USER_MANUAL.md](docs/USER_MANUAL.md)。
