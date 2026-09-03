@@ -1,0 +1,20 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icon">
+    <file alias="c.png">icon/c.png</file>
+    <file alias="close_dot.png">icon/close_dot.png</file>
+    <file alias="close_dot_hover.png">icon/close_dot_hover.png</file>
+    <file alias="code.png">icon/code.png</file>
+    <file alias="cpp.png">icon/cpp.png</file>
+    <file alias="css.png">icon/css.png</file>
+    <file alias="gitee.png">icon/gitee.png</file>
+    <file alias="github.png">icon/github.png</file>
+    <file alias="google.png">icon/google.png</file>
+    <file alias="img.png">icon/img.png</file>
+    <file alias="java.png">icon/java.png</file>
+    <file alias="js.png">icon/js.png</file>
+    <file alias="logo.ico">icon/logo.ico</file>
+    <file alias="python.png">icon/python.png</file>
+    <file alias="rust.png">icon/rust.png</file>
+  </qresource>
+</RCC>

@@ -1,0 +1,44 @@
+#pragma once
+#include <QDialog>
+#include <QStringList>
+
+class QLineEdit;
+class QPlainTextEdit;
+class QRadioButton;
+class QListWidget;
+class QLabel;
+class QPushButton;
+class GitHubService;
+class GiteeService;
+
+// 独立发布弹窗：仓库 / 标签 / 标题 / 说明 / 正式|预发布 / 附件
+class ReleaseDialog : public QDialog {
+    Q_OBJECT
+public:
+    ReleaseDialog(const QString &owner, const QString &repo, const QString &platform,
+                  QWidget *parent = nullptr);
+
+private slots:
+    void chooseAssets();
+    void removeSelectedAsset();
+    void publish();
+
+private:
+    void setBusy(bool on);
+    void uploadNext(qint64 releaseId, const QString &htmlUrl);
+    void finishOk(const QString &htmlUrl);
+    void finishErr(const QString &err);
+
+    QString m_owner, m_repo, m_platform;
+    GitHubService *m_gh = nullptr;
+    GiteeService *m_gitee = nullptr;
+
+    QLineEdit *m_tagEdit = nullptr, *m_titleEdit = nullptr;
+    QPlainTextEdit *m_bodyEdit = nullptr;
+    QRadioButton *m_stableRadio = nullptr, *m_preRadio = nullptr;
+    QListWidget *m_assetList = nullptr;
+    QLabel *m_status = nullptr;
+    QPushButton *m_publishBtn = nullptr, *m_cancelBtn = nullptr;
+    QStringList m_pendingAssets;
+    int m_uploadIdx = 0;
+};
