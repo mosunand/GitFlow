@@ -27,6 +27,9 @@
 #include <QMessageBox>
 #include <QApplication>
 #include <QInputDialog>
+#include <QPointer>
+#include <QJsonObject>
+#include <QJsonArray>
 
 namespace {
 AccountService *acct() {
@@ -170,7 +173,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent) {
 
     // 初始值：输入框永远空白，不回显本机任何身份信息（避免误解为打包了个人信息）
     loadAccounts();
-    const QString cur = QString::fromLatin1("git");
     detectGit();
 }
 
@@ -231,6 +233,14 @@ void SettingsDialog::browseGit() {
     m_gitPathEdit->setText(path);
     settings::setGitPath(path);
     gitSvc()->setGitPath(path);
+    m_gitCurrent->setText(i18n::t("git_in_use") + ": " + path);
+    // 选完当场验一次版本：选错文件（比如选到 gitk.exe）要立刻看得见
+    QProcess p;
+    p.start(path, { "--version" });
+    if (p.waitForFinished(3000) && p.exitCode() == 0)
+        m_gitStatus->setText("✅ " + QString::fromUtf8(p.readAllStandardOutput()).trimmed());
+    else
+        m_gitStatus->setText("❌ " + i18n::t("not_set"));
 }
 
 void SettingsDialog::browseStorage() {
@@ -256,8 +266,11 @@ void SettingsDialog::loadAccounts() {
     m_accountList->clear();
     const Account cur = acct()->currentAccount();
     for (const QString &full : acct()->listUsernames()) {
+        // 文件名形如 <platform>_<username>：用户名本身可能含下划线，
+        // 只能按第一个下划线切分（section('_',1) 会把 "my_user" 截成 "my"，
+        // 导致列表显示错用户名、删除/设为当前操作到不存在的账户）
         const QString platform = full.section('_', 0, 0);
-        const QString user = full.section('_', 1);
+        const QString user = full.mid(platform.size() + 1);
         const bool isCur = cur.username == user && cur.platform == platform;
         const QString icon = platform == "gitee" ? "gitee" : "github";
         auto *item = new QListWidgetItem(
@@ -285,8 +298,9 @@ void SettingsDialog::deleteAccount() {
     auto *item = m_accountList->currentItem();
     if (!item) return;
     const QStringList up = item->data(Qt::UserRole).toStringList();
+    // 问的是账户名：up[0]=用户名 up[1]=平台，原来传 up[1] 会问"确定删除 github 吗"
     if (QMessageBox::question(this, i18n::t("confirm_delete"),
-                              i18n::t("delete_q").arg(up[1])) != QMessageBox::Yes)
+                              i18n::t("delete_q").arg(up[0] + " (" + up[1] + ")")) != QMessageBox::Yes)
         return;
     acct()->removeAccount(up[0], up[1]);
     loadAccounts();
@@ -309,16 +323,39 @@ void SettingsDialog::testConnection() {
     if (!cur) { m_status->setText(i18n::t("select_account")); return; }
     const QStringList up = cur->data(Qt::UserRole).toStringList();
     const Account a = acct()->loadAccount(up[0], up[1]);
+    if (a.token.isEmpty()) {
+        m_status->setText("❌ " + i18n::t("connect_failed") + ": " + i18n::t("token_invalid_msg"));
+        return;
+    }
     m_status->setText(i18n::t("testing"));
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    // 同步验证（简版）
-    GitHubService gh(a.platform == "github" ? a.token : QString());
-    GiteeService gs(a.platform == "gitee" ? a.token : QString());
-    // 使用信号连接复杂，此处省略异步，直接检测 token 是否存在
-    QApplication::restoreOverrideCursor();
-    m_status->setText(a.token.isEmpty()
-                          ? "❌ " + i18n::t("connect_failed")
-                          : "✅ " + i18n::t("connect_success") + " (" + up[1] + "/" + up[0] + ")");
+    // 真去请求一次 /user：此前只判断 token 是否非空，失效/过期的 Token 也会显示"连接成功"
+    QPointer<SettingsDialog> self(this);
+    auto done = [self, up](bool ok, const QJsonArray &, const QJsonObject &, const QString &err) {
+        if (!self) return;
+        if (ok) {
+            self->m_status->setText("✅ " + i18n::t("connect_success") + " (" + up[1] + "/" + up[0] + ")");
+            return;
+        }
+        const QString msg = (err.contains(QLatin1String("Bad credentials"), Qt::CaseInsensitive)
+                             || err.contains(QLatin1String("Unauthorized"), Qt::CaseInsensitive)
+                             || err.contains(QLatin1String("401")))
+                                ? i18n::t("token_invalid_msg") : err;
+        self->m_status->setText("❌ " + i18n::t("connect_failed") + ": " + msg);
+    };
+    // 服务不设父对象，回调里 deleteLater 回收；请求在途时本对话框可能已销毁，故用 QPointer 兜底
+    if (up[1] == QLatin1String("gitee")) {
+        auto *svc = new GiteeService(a.token);
+        svc->verifyUser([svc, done](bool ok, const QJsonArray &arr, const QJsonObject &obj, const QString &err) {
+            svc->deleteLater();
+            done(ok, arr, obj, err);
+        });
+    } else {
+        auto *svc = new GitHubService(a.token);
+        svc->verifyUser([svc, done](bool ok, const QJsonArray &arr, const QJsonObject &obj, const QString &err) {
+            svc->deleteLater();
+            done(ok, arr, obj, err);
+        });
+    }
 }
 
 void SettingsDialog::applyThemeLang() {}

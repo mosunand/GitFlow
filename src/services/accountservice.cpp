@@ -28,7 +28,7 @@ QStringList AccountService::listUsernames() const {
     QStringList out;
     const QDir dir(paths::accountsDir());
     for (const QFileInfo &fi : dir.entryInfoList({ "*.json" }, QDir::Files))
-        out.append(fi.completeBaseName()); // "github_mosunand"
+        out.append(fi.completeBaseName()); // "github_<username>"
     return out;
 }
 

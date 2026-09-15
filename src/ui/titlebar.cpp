@@ -105,7 +105,9 @@ void TitleBar::updateGithubHtml() {
 }
 
 bool TitleBar::onInteractiveChild(const QPoint &pos) const {
-    return childAt(pos) != nullptr;
+    // 只有按钮算"可交互"：logo/标题这些纯展示 QLabel 若也算，
+    // 点在标题文字上就没法拖动窗口了
+    return qobject_cast<QPushButton *>(childAt(pos)) != nullptr;
 }
 
 // 边缘 6px 热区触发系统级调整窗口大小（与 Python 版一致）

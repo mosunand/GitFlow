@@ -57,7 +57,10 @@ RestService::RestService(const QString &token, const QString &baseUrl, QObject *
     const QString proxy = proxy::detectSystemProxy();
     if (!proxy.isEmpty()) {
         const QUrl u(proxy);
-        QNetworkProxy p(QNetworkProxy::HttpProxy, u.host(), u.port(80));
+        // 按 scheme 区分类型：ALL_PROXY 常配 socks5://，当成 HTTP 代理用会直接连不上
+        const bool socks = u.scheme().startsWith(QLatin1String("socks"), Qt::CaseInsensitive);
+        QNetworkProxy p(socks ? QNetworkProxy::Socks5Proxy : QNetworkProxy::HttpProxy,
+                        u.host(), u.port(80));
         if (!u.userInfo().isEmpty()) {
             p.setUser(u.userInfo().section(':', 0, 0));
             p.setPassword(u.userInfo().section(':', 1));
@@ -81,6 +84,15 @@ void RestService::get(const QString &path, const Callback &cb, const QUrlQuery &
     QNetworkRequest req(url);
     applyAuth(req, m_token);
     QNetworkReply *reply = m_nam->get(req);
+    connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
+}
+
+void RestService::remove(const QString &path, const Callback &cb, const QUrlQuery &query) {
+    QUrl url(m_baseUrl + path);
+    if (!query.isEmpty()) url.setQuery(query);
+    QNetworkRequest req(url);
+    applyAuth(req, m_token);
+    QNetworkReply *reply = m_nam->deleteResource(req);
     connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
 }
 
@@ -108,12 +120,15 @@ void RestService::postMultipart(const QUrl &url, QHttpMultiPart *multi, const Ca
     connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
 }
 
-void RestService::postRaw(const QUrl &url, const QByteArray &data,
-                          const QString &contentType, const Callback &cb) {
+void RestService::postStream(const QUrl &url, QIODevice *device, const QString &contentType,
+                             const Callback &cb) {
     QNetworkRequest req(url);
     req.setHeader(QNetworkRequest::ContentTypeHeader, contentType);
+    if (device->size() > 0)   // QFile 等随机访问设备：给出长度，避免退化成 chunked
+        req.setHeader(QNetworkRequest::ContentLengthHeader, device->size());
     applyAuth(req, m_token, 300000);   // 上传给更长超时
-    QNetworkReply *reply = m_nam->post(req, data);
+    QNetworkReply *reply = m_nam->post(req, device);
+    device->setParent(reply);          // 随 reply 一起释放，避免文件句柄泄漏
     connect(reply, &QNetworkReply::finished, this, [reply, cb] { finishReply(reply, cb); });
 }
 
@@ -163,8 +178,11 @@ void GitHubService::createRelease(const QString &owner, const QString &repo, con
 
 void GitHubService::uploadAsset(const QString &owner, const QString &repo, qint64 releaseId,
                                 const QString &filePath, const Callback &cb) {
-    QFile f(filePath);
-    if (!f.open(QIODevice::ReadOnly)) {
+    // 流式读取：以前是 f.readAll() 把整个附件读进内存，
+    // 而 README 明确说 GitHub 单附件可到 2GB，那样必然内存耗尽
+    auto *f = new QFile(filePath);
+    if (!f->open(QIODevice::ReadOnly)) {
+        delete f;
         cb(false, QJsonArray{}, QJsonObject{}, QStringLiteral("cannot open %1").arg(filePath));
         return;
     }
@@ -174,5 +192,10 @@ void GitHubService::uploadAsset(const QString &owner, const QString &repo, qint6
     QUrlQuery q;
     q.addQueryItem("name", name);
     url.setQuery(q);
-    postRaw(url, f.readAll(), "application/octet-stream", cb);
+    postStream(url, f, "application/octet-stream", cb);
+}
+
+// 删除仓库：GitHub 要求 Token 勾选 delete_repo 权限（仅有 repo 权限会返回 403）
+void GitHubService::deleteRepo(const QString &owner, const QString &repo, const Callback &cb) {
+    remove(QStringLiteral("/repos/%1/%2").arg(owner, repo), cb);
 }

@@ -10,9 +10,10 @@
 #include <QUrl>
 
 namespace {
+// 个人信息只允许出现在"软件说明（关于窗口）"与 README 两处，其余位置一律不放
 constexpr char kEmail[] = "moshuai1013@outlook.com";
 constexpr char kRepo[] = "https://github.com/mosunand/GitFlow";
-constexpr char kVersion[] = "v1.0.0";
+constexpr char kVersion[] = "v4.0.0";
 } // namespace
 
 AboutDialog::AboutDialog(QWidget *parent) : QDialog(parent) {

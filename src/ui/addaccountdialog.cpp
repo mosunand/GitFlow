@@ -16,6 +16,7 @@
 #include <QComboBox>
 #include <QLineEdit>
 #include <QDate>
+#include <QPointer>
 
 namespace {
 AccountService *acct() {
@@ -80,9 +81,14 @@ AddAccountDialog::AddAccountDialog(QWidget *parent) : QDialog(parent) {
     // 可直接输入数字，也可下拉选常用天数；留空 = 不限
     m_tokenDays = new QComboBox;
     m_tokenDays->setEditable(true);
+    // 首项留空 = 不限（默认）。若第 0 项就是 "30"，addItems 会默认选中它，
+    // 于是每个新账户都被悄悄设成 30 天后过期（十来天后标题栏就开始红色倒计时），
+    // 与"有效期（可选）· 留空 = 不限"的说明正好相反
+    m_tokenDays->addItem(QString());
     m_tokenDays->addItems({ QStringLiteral("30"), QStringLiteral("60"), QStringLiteral("90"),
                             QStringLiteral("180"), QStringLiteral("365"),
                             QStringLiteral("730"), QStringLiteral("3650") });
+    m_tokenDays->setCurrentIndex(0);
     m_tokenDays->lineEdit()->setPlaceholderText(i18n::t("validity_unlimited"));
     m_tokenDays->setMinimumHeight(32);
     m_tokenDays->setToolTip(i18n::t("token_validity_tip"));
@@ -137,18 +143,21 @@ void AddAccountDialog::verifyAndAdd() {
     }
     m_status->setText(i18n::t("verifying"));
     m_verifyBtn->setEnabled(false);
-    // 服务无父对象，回调里 deleteLater 回收；verifyUser 在具体服务类上
+    // 服务无父对象，回调里 deleteLater 回收；verifyUser 在具体服务类上。
+    // 回调的接收者是 svc 而非本对话框，请求在途时对话框可能已被销毁，
+    // 必须用 QPointer 兜住，否则会访问已析构的 this
+    QPointer<AddAccountDialog> self(this);
     if (m_platform == QLatin1String("gitee")) {
         auto *svc = new GiteeService(token);
-        svc->verifyUser([this, svc](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
+        svc->verifyUser([self, svc](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
             svc->deleteLater();
-            handleVerify(ok, obj, err);
+            if (self) self->handleVerify(ok, obj, err);
         });
     } else {
         auto *svc = new GitHubService(token);
-        svc->verifyUser([this, svc](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
+        svc->verifyUser([self, svc](bool ok, const QJsonArray &, const QJsonObject &obj, const QString &err) {
             svc->deleteLater();
-            handleVerify(ok, obj, err);
+            if (self) self->handleVerify(ok, obj, err);
         });
     }
 }

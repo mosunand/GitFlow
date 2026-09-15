@@ -48,10 +48,14 @@ public:
     void setPlainText(const QString &t);
     QString openPath() const { return m_openPath; }
     void setOpenPath(const QString &p) { m_openPath = p; }
+    // 原文件的行尾风格（"\n" 或 "\r\n"）：保存时必须写回同一种
+    QString lineEnding() const { return m_lineEnding; }
+    void setLineEnding(const QString &eol) { m_lineEnding = eol; }
     bool isModified() const;   // 编辑器内容是否有未保存的修改
     void setModified(bool m);   // 保存后重置未保存标记
     void applyTheme();
-    void setEditorFontPointSize(int pt);
+    // notify=true：弹字号提示并记住选择（用户操作）；构造/还原时传 false
+    void setEditorFontPointSize(int pt, bool notify = true);
     int editorFontPointSize() const;
 
 signals:
@@ -62,6 +66,7 @@ protected:
     bool eventFilter(QObject *obj, QEvent *e) override;
 
 private:
+    void recountFind();   // 按当前查找词重算匹配与计数（查找词变化、文档编辑共用）
     QLabel *m_zoomToast = nullptr;
     QTimer *m_zoomTimer = nullptr;
     QWidget *m_findBar = nullptr;
@@ -73,4 +78,5 @@ private:
     QVector<QTextCursor> m_cursors;
     int m_current = -1;
     QString m_openPath;
+    QString m_lineEnding = QStringLiteral("\n");
 };

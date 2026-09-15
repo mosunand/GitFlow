@@ -7,6 +7,7 @@
 class QNetworkAccessManager;
 class QNetworkReply;
 class QHttpMultiPart;
+class QIODevice;
 
 // GitHub / Gitee REST API 基类：自动继承系统代理
 class RestService : public QObject {
@@ -19,12 +20,15 @@ public:
     using Callback = std::function<void(bool ok, const QJsonArray &arr, const QJsonObject &obj, const QString &err)>;
 
     void get(const QString &path, const Callback &cb, const QUrlQuery &query = {});
+    // DELETE /repos/... （删除仓库等不可逆操作）
+    void remove(const QString &path, const Callback &cb, const QUrlQuery &query = {});
     void post(const QString &path, const QJsonObject &body, const Callback &cb);
     // Gitee 等表单协议接口：application/x-www-form-urlencoded
     void postForm(const QString &path, const QUrlQuery &form, const Callback &cb);
     // 附件上传：multipart/form-data（Gitee attach_files 要求）
     void postMultipart(const QUrl &url, QHttpMultiPart *multi, const Callback &cb);
-    void postRaw(const QUrl &url, const QByteArray &data, const QString &contentType, const Callback &cb);
+    // 原始体上传，按流读取 device（大附件不能整个读进内存）
+    void postStream(const QUrl &url, QIODevice *device, const QString &contentType, const Callback &cb);
 
 protected:
     QNetworkAccessManager *m_nam = nullptr;
@@ -49,4 +53,6 @@ public:
                        const QString &name, const QString &body, bool prerelease, const Callback &cb);
     void uploadAsset(const QString &owner, const QString &repo, qint64 releaseId,
                      const QString &filePath, const Callback &cb);
+    // 删除远程仓库（不可逆；需要 Token 具备 delete_repo 权限）
+    void deleteRepo(const QString &owner, const QString &repo, const Callback &cb);
 };

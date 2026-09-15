@@ -49,4 +49,5 @@ protected:
     QStringList m_pendingAssets;
     int m_uploadIdx = 0;
     QString m_targetBranch;                // 仓库默认分支（Gitee 创建 Release 必传）
+    QString m_lastSyncedTitle = QStringLiteral("v1.0.0");   // 标题最后一次跟随标签的值
 };

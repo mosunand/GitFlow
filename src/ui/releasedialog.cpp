@@ -93,11 +93,11 @@ ReleaseDialog::ReleaseDialog(const QString &owner, const QString &repo,
     m_titleEdit->setMinimumHeight(32);
     layout->addWidget(m_titleEdit);
     connect(m_tagEdit, &QLineEdit::textChanged, this, [this](const QString &t) {
-        // 标题未手动改过时，跟随标签
-        static QString lastSynced = QStringLiteral("v1.0.0");
-        if (m_titleEdit->text() == lastSynced) {
+        // 标题未手动改过时，跟随标签。注意不能用函数级 static：
+        // 它跨对话框实例共享，第二次打开发布窗时还留着上次的值，跟随就断了
+        if (m_titleEdit->text() == m_lastSyncedTitle) {
             m_titleEdit->setText(t);
-            lastSynced = t;
+            m_lastSyncedTitle = t;
         }
     });
 
@@ -230,7 +230,7 @@ void ReleaseDialog::precheckReleases() {
     RestService *listSvc = m_platform == QLatin1String("gitee")
         ? static_cast<RestService *>(m_gitee)
         : static_cast<RestService *>(m_gh);
-    listSvc->get(QStringLiteral("/repos/%1/%2/releases").arg(m_owner, m_repo),
+    listSvc->get(QStringLiteral("/repos/%1/%2/releases?per_page=100&page=1").arg(m_owner, m_repo),
                  [self, tag](bool, const QJsonArray &arr, const QJsonObject &, const QString &) {
         if (!self) return;
         for (const auto &v : arr)
@@ -289,7 +289,18 @@ void ReleaseDialog::uploadNext(qint64 releaseId, const QString &htmlUrl) {
     auto cb = [self, releaseId, htmlUrl](bool ok, const QJsonArray &, const QJsonObject &, const QString &err) {
         if (!self) return;
         if (!ok) {
-            self->finishErr(err);
+            // Release 已创建成功，只是这个附件失败：不能简单报失败
+            // （用户重试会撞"Tag 已存在"），明确告知可去网页端补传
+            self->setBusy(false);
+            const int doneN = self->m_uploadIdx;
+            const int total = self->m_pendingAssets.size();
+            self->m_status->setText("⚠ " + i18n::t("asset_partial_fail")
+                .arg(doneN).arg(total).arg(err));
+            self->m_status->setStyleSheet(QStringLiteral("color:#e3b341;"));
+            QMessageBox::warning(self, i18n::t("create_release"),
+                                 i18n::t("asset_partial_fail").arg(doneN).arg(total).arg(err)
+                                 + QStringLiteral("\n\n") + htmlUrl);
+            self->accept();
             return;
         }
         ++self->m_uploadIdx;

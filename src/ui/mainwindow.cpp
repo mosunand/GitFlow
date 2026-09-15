@@ -41,6 +41,7 @@
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QColor>
+#include <QDirIterator>
 #include <QPainter>
 #include <QStackedWidget>
 #include <QtConcurrent>
@@ -58,11 +59,13 @@
 #include <QFileDialog>
 #include <QInputDialog>
 #include <QMessageBox>
+#include <QProgressDialog>
+#include <QEventLoop>
+#include <QImageReader>
 #include <QMenu>
 #include <QProcess>
 #include <QStatusBar>
 #include <QHeaderView>
-#include "proxy.h"
 #include <QDir>
 #include <QTimer>
 #include <QFile>
@@ -142,7 +145,92 @@ QString ansiToHtml(const QString &in) {
     if (open) out += QLatin1String("</span>");
     return out;
 }
+// 文件树：支持把外部文件/文件夹拖到指定目录节点上。
+// QTreeWidget 默认不处理外部 URL 拖放，事件会冒泡到主窗口的 dropEvent，
+// 而那里只认仓库根 —— 于是拖到哪个目录上都只会落在根目录
+class DropTree : public QTreeWidget {
+public:
+    // (被拖入的本地路径列表, 目标目录相对路径；空串=仓库根)
+    std::function<void(const QStringList &, const QString &)> onDrop;
+    // 拖拽过程中提示落点（rel 为空串 = 仓库根），以及拖拽离开
+    std::function<void(const QString &)> onHoverTarget;
+    std::function<void()> onHoverEnd;
+
+    explicit DropTree(QWidget *parent = nullptr) : QTreeWidget(parent) {
+        setAcceptDrops(true);
+        setDragDropMode(QAbstractItemView::DropOnly);   // 只接收拖入，不做内部拖拽移动
+    }
+
+protected:
+    // 外部 URL 拖放自己接管：交给基类处理时，QAbstractItemView 会因模型不认
+    // uri-list 而 ignore，接受状态拿不回来
+    void dragEnterEvent(QDragEnterEvent *e) override {
+        if (e->mimeData()->hasUrls()) { e->acceptProposedAction(); return; }
+        QTreeWidget::dragEnterEvent(e);
+    }
+    void dragMoveEvent(QDragMoveEvent *e) override {
+        if (!e->mimeData()->hasUrls()) { QTreeWidget::dragMoveEvent(e); return; }
+        // 实时高亮落点：把目标目录设为当前项（复用选中样式），并把路径报给状态栏。
+        // 不给这个反馈，用户根本不知道松手后会放进哪个目录
+        QTreeWidgetItem *it = itemAt(e->position().toPoint());
+        if (it != m_hot) {
+            m_hot = it;
+            if (m_hot) setCurrentItem(m_hot);
+            if (onHoverTarget) onHoverTarget(dirRelOf(m_hot));
+        }
+        e->acceptProposedAction();
+    }
+    void dragLeaveEvent(QDragLeaveEvent *e) override {
+        m_hot = nullptr;
+        if (onHoverEnd) onHoverEnd();
+        QTreeWidget::dragLeaveEvent(e);
+    }
+    void dropEvent(QDropEvent *e) override {
+        if (!e->mimeData()->hasUrls()) { QTreeWidget::dropEvent(e); return; }
+        QStringList paths;
+        for (const QUrl &u : e->mimeData()->urls()) {
+            const QString local = u.toLocalFile();
+            if (!local.isEmpty()) paths << local;
+        }
+        const QString base = dirRelOf(m_hot ? m_hot : itemAt(e->position().toPoint()));
+        m_hot = nullptr;
+        if (onHoverEnd) onHoverEnd();
+        if (paths.isEmpty()) { e->ignore(); return; }
+        e->acceptProposedAction();
+        if (onDrop) onDrop(paths, base);
+    }
+
+private:
+    // 节点对应的目录：目录节点=它本身，文件节点=其所在目录，根节点/空白=仓库根("")
+    QString dirRelOf(QTreeWidgetItem *item) const {
+        if (!item) return {};
+        QStringList parts;
+        QTreeWidgetItem *n = item;
+        while (n && n->parent()) { parts.prepend(n->text(0)); n = n->parent(); }
+        const QString rel = parts.join('/');
+        if (rel.isEmpty()) return {};
+        if (!item->data(0, Qt::UserRole + 1).toString().isEmpty()) return rel;   // 目录
+        const int slash = rel.lastIndexOf('/');
+        return slash < 0 ? QString() : rel.left(slash);
+    }
+    QTreeWidgetItem *m_hot = nullptr;
+};
+
+// 只读等宽面板（Diff / 分支图）的内联样式，主题切换时要重刷，故抽出来共用
+QString monoReadOnlyQss(const char *widget) {
+    return QStringLiteral("%1{background-color:%2;color:%3;border:1px solid %4;"
+                          "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
+        .arg(QLatin1String(widget), theme::bg(), theme::text(), theme::border());
+}
+
 AccountService *acct() { static AccountService s; return &s; }
+
+// 用户输入的名字若写成绝对路径（D:/x、/x 等），QDir::filePath 会原样返回，
+// 于是文件/文件夹被建到仓库外面，刷新后仓库里什么都看不到
+bool insideRepo(const QString &repo, const QString &full) {
+    const QString root = QDir::cleanPath(QDir(repo).absolutePath());
+    return QDir::cleanPath(full).startsWith(root + QLatin1Char('/'));
+}
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
@@ -272,6 +360,13 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
 
 void MainWindow::closeEvent(QCloseEvent *e) {
     if (m_pushProcess) m_pushProcess->kill();
+    // push 三阶段的中间进程（fetch/计数/变基）也要终止，
+    // 否则窗口析构后 git 子进程会变成孤儿进程残留
+    const auto kids = findChildren<QProcess *>();
+    for (QProcess *p : kids) {
+        if (p != m_pushProcess && p->state() == QProcess::Running)
+            p->kill();
+    }
     e->accept();
 }
 
@@ -401,13 +496,34 @@ void MainWindow::buildCentral() {
     m_newFileBtn = new QPushButton("+ " + i18n::t("new_file"));
     connect(m_newFileBtn, &QPushButton::clicked, this, &MainWindow::createFileDialog);
     lh->addWidget(m_newFileBtn);
+    m_newFolderBtn = new QPushButton("+ " + i18n::t("new_folder"));
+    connect(m_newFolderBtn, &QPushButton::clicked, this, &MainWindow::createFolderDialog);
+    lh->addWidget(m_newFolderBtn);
     m_newBranchBtn = new QPushButton("+ " + i18n::t("new_branch"));
     connect(m_newBranchBtn, &QPushButton::clicked, this, &MainWindow::createBranchDialog);
     lh->addWidget(m_newBranchBtn);
     ll->addLayout(lh);
 
     auto *lsplit = new QSplitter(Qt::Vertical);
-    m_fileTree = new QTreeWidget;
+    auto *tree = new DropTree;
+    tree->onDrop = [this](const QStringList &paths, const QString &baseRel) {
+        importIntoRepo(paths, baseRel);
+    };
+    // 拖拽中在状态栏写明落点（并把原位文案暂存，松手/离开后还原）
+    tree->onHoverTarget = [this](const QString &rel) {
+        if (!m_hoverStatusSaved) {
+            m_statusBeforeHover = m_statusLabel->text();
+            m_hoverStatusSaved = true;
+        }
+        const QString where = rel.isEmpty() ? QDir(m_currentFile).dirName() : rel;
+        m_statusLabel->setText("\U0001F4C2 " + i18n::t("drop_target_hint").arg(where));
+    };
+    tree->onHoverEnd = [this] {
+        if (!m_hoverStatusSaved) return;
+        m_statusLabel->setText(m_statusBeforeHover);
+        m_hoverStatusSaved = false;
+    };
+    m_fileTree = tree;
     m_fileTree->setIndentation(14);
     m_fileTree->setHeaderHidden(true);
     m_fileTree->setColumnCount(1);
@@ -543,15 +659,16 @@ void MainWindow::buildCentral() {
     m_imageZoomTimer = new QTimer(this);
     m_imageZoomTimer->setSingleShot(true);
     connect(m_imageZoomTimer, &QTimer::timeout, m_imageZoomToast, &QLabel::hide);
+    // 图片随控件尺寸重算的去抖定时器（见 eventFilter 的 Resize 分支）
+    m_imageFitTimer = new QTimer(this);
+    m_imageFitTimer->setSingleShot(true);
+    connect(m_imageFitTimer, &QTimer::timeout, this, &MainWindow::applyImageZoom);
     m_imageView->installEventFilter(this);
     m_detailTabs->addTab(m_editorHost, i18n::t("editor"));
     m_diffEdit = new QPlainTextEdit;
     m_diffEdit->setReadOnly(true);
     m_diffEdit->setFont(QFont("Consolas", 10));
-    m_diffEdit->setStyleSheet(QString(
-        "QPlainTextEdit{background-color:%1;color:%2;border:1px solid %3;"
-        "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
-        .arg(theme::bg(), theme::text(), theme::border()));
+    m_diffEdit->setStyleSheet(monoReadOnlyQss("QPlainTextEdit"));
     m_detailTabs->addTab(m_diffEdit, "Diff");
     m_historyGroup = new QGroupBox(i18n::t("commit_history"));
     auto *hl = new QVBoxLayout(m_historyGroup);
@@ -576,10 +693,13 @@ void MainWindow::buildCentral() {
     });
     connect(m_historyList, &QListWidget::currentRowChanged, this, [this](int row) {
         if (row < 0) return;
-        const QVariant d = m_historyList->item(row)->data(Qt::UserRole);
+        auto *rowItem = m_historyList->item(row);
+        if (!rowItem) return;
+        const QVariant d = rowItem->data(Qt::UserRole);
         if (!d.isValid()) return;
         const QVariantMap m = d.toMap();
-        m_detailTabs->setCurrentIndex(1);
+        // 不能用固定下标：Diff 页签可被关闭/移位，indexOf 才能定位到真正的差异页
+        ensureTab(m_diffEdit, 1, QStringLiteral("Diff"));
         m_diffEdit->setPlainText(m.value("hash").toString() + "  " +
                                  m.value("subject").toString() + "\n\n..." );
         // 后台读取该提交的完整差异
@@ -628,10 +748,7 @@ void MainWindow::buildCentral() {
     m_graphEdit = new QTextEdit;
     m_graphEdit->setReadOnly(true);
     m_graphEdit->setFont(QFont("Consolas", 10));
-    m_graphEdit->setStyleSheet(QString(
-        "QTextEdit{background-color:%1;color:%2;border:1px solid %3;"
-        "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
-        .arg(theme::bg(), theme::text(), theme::border()));
+    m_graphEdit->setStyleSheet(monoReadOnlyQss("QTextEdit"));
     m_detailTabs->addTab(m_graphEdit, i18n::t("tab_graph"));
     ensureTab(m_editorHost, 0, i18n::t("editor"));
     splitter->addWidget(m_detailTabs);
@@ -706,7 +823,13 @@ void MainWindow::initRepoDialog() {
 void MainWindow::openRepo(const QString &path) {
     if (!git()->isRepository(path)) {
         if (QMessageBox::question(this, i18n::t("init_q"), i18n::t("init_btn")) == QMessageBox::Yes) {
-            git()->init(path);
+            // openRepo 会被拖放处理器和面板信号直接调用，异常逃出去就是未定义行为
+            try {
+                git()->init(path);
+            } catch (const std::exception &e) {
+                QMessageBox::critical(this, i18n::t("init_failed"), e.what());
+                return;
+            }
         } else {
             return;
         }
@@ -806,10 +929,27 @@ void MainWindow::applyRefresh(const RefreshData &d) {
         m_branchCombo->blockSignals(true);
         m_branchCombo->clear();
         m_branchCombo->addItems(d.branches);
-        if (!d.st.branch.isEmpty()) m_branchCombo->setCurrentText(d.st.branch);
+        // 当前分支来自 status 任务，而 branch/status 是两个并行任务、到达顺序不定，
+        // 所以这里读 m_currentBranch（原实现只读同一个结果里的 d.st.branch，
+        // 分支任务里根本没有 status 字段 → 下拉框永远停在字母序第一个分支上）
+        const QString want = !d.st.branch.isEmpty() ? d.st.branch : m_currentBranch;
+        if (!want.isEmpty()) {
+            if (m_branchCombo->findText(want) < 0)
+                m_branchCombo->addItem(want);   // 例如分离头指针的 "(detached)"
+            m_branchCombo->setCurrentText(want);
+        }
         m_branchCombo->blockSignals(false);
     }
     if (d.wantStatus) {
+        // 当前分支同步到下拉框：与分支列表谁先到都不影响最终显示
+        m_currentBranch = d.st.branch;
+        if (!m_currentBranch.isEmpty()) {
+            m_branchCombo->blockSignals(true);
+            if (m_branchCombo->findText(m_currentBranch) < 0)
+                m_branchCombo->addItem(m_currentBranch);
+            m_branchCombo->setCurrentText(m_currentBranch);
+            m_branchCombo->blockSignals(false);
+        }
         // 算法优化：只构建第一层（单次目录枚举，毫秒级），子目录展开时才懒加载
         ++m_treeGen;   // 树重建，作废未完成的懒加载请求
         if (m_fileTree->topLevelItem(0)) collectExpandedDirs(m_fileTree->topLevelItem(0));
@@ -836,6 +976,13 @@ void MainWindow::applyRefresh(const RefreshData &d) {
             allRoot->addChild(it);
         }
         restoreExpandedDirs();
+        // 再叠加"刚新建/添加"要露出的目录：必须放在旧状态快照之后，否则会被覆盖掉
+        if (!m_revealDirs.isEmpty()) {
+            m_expandedDirs.unite(m_revealDirs);
+            m_revealDirs.clear();
+            restoreExpandedDirs();
+        }
+        revealPendingItem();
         // 变更分组
         m_changeTree->clear();
         auto addTree = [&](const QString &title, const QList<GitFileItem> &items) {
@@ -855,6 +1002,7 @@ void MainWindow::applyRefresh(const RefreshData &d) {
                     }
                 }());
                 c->setData(0, Qt::UserRole, f.path);
+                c->setData(0, Qt::UserRole + 1, int(f.status));
                 root->addChild(c);
             }
             m_changeTree->addTopLevelItem(root);
@@ -901,8 +1049,42 @@ QString MainWindow::selectedFilePath() const {
     return parts.join('/');
 }
 
-void MainWindow::onFileDoubleClicked(const QString &path) {
-    if (path.isEmpty()) return;
+// 新建/添加的目标目录：跟随文件树当前选中项 —— 选中的是目录就用它本身，
+// 选中的是文件就用它所在目录，什么都没选就是仓库根（空串）。
+// 三个入口原先一律按仓库根解析，于是在文件夹上右键新建，文件却跑到了根目录
+QString MainWindow::selectedTargetDir() const {
+    if (!m_fileTree || m_currentFile.isEmpty()) return {};
+    const QString rel = selectedFilePath();
+    if (rel.isEmpty()) return {};
+    if (QFileInfo(QDir(m_currentFile).filePath(rel)).isDir()) return rel;
+    const int slash = rel.lastIndexOf('/');
+    return slash < 0 ? QString() : rel.left(slash);
+}
+
+// 让某个目录及其父链在下次树重建后自动展开。
+// 注意不能直接写 m_expandedDirs：applyRefresh 重建树之前会先用 collectExpandedDirs
+// 把"旧树"的展开状态快照进 m_expandedDirs，而刚建好、尚未展开的目录在那一步会被
+// remove 掉 —— 展开请求就丢了，文件建在折叠目录里、界面上看不见（用户以为没建成）
+void MainWindow::markDirsExpanded(const QString &relDir) {
+    QString acc;
+    for (const QString &seg : relDir.split('/', Qt::SkipEmptyParts)) {
+        acc = acc.isEmpty() ? seg : acc + QLatin1Char('/') + seg;
+        m_revealDirs.insert(acc);
+    }
+}
+
+// 树建好/某层目录展开后，把"刚新建/添加"的那一项选中并滚到可见位置。
+// 找不到就返回（所在目录还没加载到那一层，等下一层展开回调再调一次）
+void MainWindow::revealPendingItem() {
+    if (m_revealPath.isEmpty()) return;
+    QTreeWidgetItem *it = findItemByRel(m_revealPath);
+    if (!it) return;
+    m_fileTree->setCurrentItem(it);
+    m_fileTree->scrollToItem(it);
+    m_revealPath.clear();
+}
+
+void MainWindow::onFileDoubleClicked(const QString &path) {    if (path.isEmpty()) return;
     const QString full = QDir(m_currentFile).filePath(path);
     if (QFileInfo(full).isDir()) return;
     const QString suffix = QFileInfo(full).suffix().toLower();
@@ -916,9 +1098,28 @@ void MainWindow::onFileDoubleClicked(const QString &path) {
     // 无扩展名常见文本文件（.gitignore/.gitattributes/Dockerfile/Makefile...）
     static const QSet<QString> textNames { "gitignore", "gitattributes", "dockerfile",
                                            "makefile", "license", "readme", "changelog" };
-    const bool isText = texts.contains(suffix) || textNames.contains(baseName)
-                        || suffix.isEmpty();   // 无扩展名默认按文本尝试
+    const bool knownTextName = textNames.contains(baseName);
+    bool isText = texts.contains(suffix) || knownTextName;
+    if (suffix.isEmpty() && !knownTextName) {
+        // 无扩展名：先嗅探再当文本，直接当文本会把二进制乱码灌进编辑器
+        QFile probe(full);
+        if (probe.open(QIODevice::ReadOnly)) {
+            const QByteArray head = probe.read(8192);
+            probe.close();
+            isText = !head.contains('\0');   // 含 NUL 基本可断定是二进制
+        } else {
+            isText = false;
+        }
+    }
     if (images.contains(suffix)) {
+        // 先只读头部拿尺寸（不解码像素）：超大图直接拒开，否则解码会长时间卡住界面
+        QImageReader rd(full);
+        const QSize sz = rd.size();
+        if (sz.isValid() && qint64(sz.width()) * qint64(sz.height()) > 100000000LL) {
+            QMessageBox::warning(this, i18n::t("file_too_large"),
+                                 i18n::t("img_too_large_body").arg(sz.width()).arg(sz.height()));
+            return;
+        }
         QPixmap pm(full);
         if (pm.isNull()) { QMessageBox::warning(this, path, i18n::t("img_load_failed")); return; }
         m_imagePix = pm;
@@ -934,13 +1135,40 @@ void MainWindow::onFileDoubleClicked(const QString &path) {
         showDiffForFile(path);
         return;
     }
+    // 内置编辑器不适合超大文本：QPlainTextEdit 载入几十 MB 会卡住界面，
+    // 而且编辑器是可写的，截断后保存会毁掉原文件 —— 直接拒绝打开更安全
+    const qint64 size = QFileInfo(full).size();
+    if (size > 20LL * 1024 * 1024) {
+        QMessageBox::warning(this, i18n::t("file_too_large"),
+                             i18n::t("file_too_large_body")
+                                 .arg(QString::number(size / 1024.0 / 1024.0, 'f', 1)));
+        return;
+    }
     QFile f(full);
     if (!f.open(QIODevice::ReadOnly)) return;
-    m_editorPanel->setPlainText(QString::fromUtf8(f.readAll()));
+    // 编辑器是单文档：打开新文件会覆盖当前内容，有未保存修改时先确认，避免静默丢改动
+    if (m_editorPanel->isModified() && !m_editorPanel->openPath().isEmpty()
+        && m_editorPanel->openPath() != full) {
+        QMessageBox box(this);
+        box.setWindowTitle(i18n::t("hint"));
+        box.setIcon(QMessageBox::Warning);
+        box.setText(i18n::t("unsaved_switch_q"));
+        auto *saveBtn = box.addButton(i18n::t("save"), QMessageBox::AcceptRole);
+        auto *dropBtn = box.addButton(i18n::t("discard_btn"), QMessageBox::DestructiveRole);
+        box.addButton(QMessageBox::Cancel);
+        box.exec();
+        const QAbstractButton *clicked = box.clickedButton();
+        if (clicked == saveBtn) saveCurrentEditor();
+        else if (clicked != dropBtn) return;   // 取消或直接关窗
+    }
+    const QByteArray raw = f.readAll();
+    m_editorPanel->setPlainText(QString::fromUtf8(raw));
+    // 记住原文件用的是 LF 还是 CRLF，保存时按原样写回
+    m_editorPanel->setLineEnding(raw.contains("\r\n") ? QStringLiteral("\r\n")
+                                                     : QStringLiteral("\n"));
     m_editorStack->setCurrentWidget(m_editorPanel);
     if (m_detailTabs->indexOf(m_editorHost) >= 0)
         m_detailTabs->setTabText(m_detailTabs->indexOf(m_editorHost), i18n::t("editor"));
-    m_currentFile = m_currentFile; // repo root unchanged
     ensureTab(m_editorHost, 0, i18n::t("editor"));
     m_editorPanel->setOpenPath(full);
     m_statusLabel->setText(full);
@@ -1054,6 +1282,7 @@ void MainWindow::onContextMenu(const QPoint &pos) {
     const QString full = QDir(m_currentFile).filePath(path);
     menu.addAction(i18n::t("open_edit"), this, [this, path] { onFileDoubleClicked(path); });
     menu.addAction(i18n::t("new_file"), this, &MainWindow::createFileDialog);
+    menu.addAction(i18n::t("new_folder"), this, &MainWindow::createFolderDialog);
     menu.addAction(i18n::t("add_file_menu"), this, &MainWindow::addFileDialog);
     if (QFileInfo(full).isFile()) {
         menu.addAction(i18n::t("run_code"), this, [this, full] { runCurrentFile(full); });
@@ -1062,7 +1291,7 @@ void MainWindow::onContextMenu(const QPoint &pos) {
         menu.addAction(i18n::t("view_blame"), this, [this, path] {
             try {
                 setColoredDiff(m_diffEdit, git()->blame(m_currentFile, path));
-                m_detailTabs->setCurrentIndex(1);
+                ensureTab(m_diffEdit, 1, QStringLiteral("Diff"));
             } catch (const std::exception &e) { QMessageBox::critical(this, i18n::t("error"), e.what()); }
         });
         menu.addSeparator();
@@ -1082,34 +1311,123 @@ void MainWindow::onContextMenu(const QPoint &pos) {
 
 void MainWindow::addFileDialog() {
     if (m_currentFile.isEmpty()) return;
+    const QString base = selectedTargetDir();
     QFileDialog dlg(this, i18n::t("pick_files"), m_currentFile);
     dlg.setFileMode(QFileDialog::ExistingFiles);
     dlg.setOption(QFileDialog::DontUseNativeDialog, true);
     localizeFileDialog(dlg);
     if (dlg.exec() != QDialog::Accepted) return;
     const QStringList paths = dlg.selectedFiles();
-    for (const QString &src : paths)
-        QFile::copy(src, QDir(m_currentFile).filePath(QFileInfo(src).fileName()));
-    refreshStatus();
+    int done = 0;
+    QStringList added;
+    for (const QString &src : paths) {
+        const QString name = QFileInfo(src).fileName();
+        const QString rel = base.isEmpty() ? name : base + QLatin1Char('/') + name;
+        // 目标同名时 copy 会失败，计数后如实告知
+        if (QFile::copy(src, QDir(m_currentFile).filePath(rel))) {
+            ++done;
+            added << rel;
+        }
+    }
+    if (done > 0) {
+        // 与拖放导入保持同一语义：添加即暂存，否则两个入口一个要手动 add 一个不用
+        try {
+            git()->add(m_currentFile, added);
+            m_revealPath = added.first();
+            markDirsExpanded(base);
+            refreshStatus();
+            m_statusLabel->setText("✅ " + i18n::t("added_body").arg(done)
+                                   + QStringLiteral("  (%1)").arg(i18n::t("dropped_staged_short")));
+        } catch (const std::exception &ex) {
+            QMessageBox::critical(this, i18n::t("error"), ex.what());
+        }
+    } else {
+        refreshStatus();
+        m_statusLabel->setText("⚠ " + i18n::t("dropped_none")
+                               + QStringLiteral("  (%1)").arg(i18n::t("file_exists")));
+    }
 }
 
 void MainWindow::createFileDialog() {
     if (m_currentFile.isEmpty()) return;
+    const QString base = selectedTargetDir();
+    // 目标目录写进对话框文案，避免"不知道会建在哪"的猜测
+    const QString where = base.isEmpty() ? QDir(m_currentFile).dirName() : base;
     bool ok = false;
     const QString name = QInputDialog::getText(this, i18n::t("new_file_title"),
-                                               i18n::t("file_name_label"), QLineEdit::Normal, {}, &ok);
+                                               i18n::t("file_name_label").arg(where),
+                                               QLineEdit::Normal, {}, &ok);
     if (!ok || name.trimmed().isEmpty()) return;
-    const QString full = QDir(m_currentFile).filePath(name.trimmed());
+    const QString rel = base.isEmpty() ? name.trimmed() : base + QLatin1Char('/') + name.trimmed();
+    const QString full = QDir(m_currentFile).filePath(rel);
+    if (!insideRepo(m_currentFile, full)) {
+        QMessageBox::warning(this, i18n::t("hint"), i18n::t("path_outside_repo"));
+        return;
+    }
     if (QFileInfo::exists(full)) { QMessageBox::warning(this, i18n::t("file_exists"), i18n::t("file_exists_body")); return; }
     QDir().mkpath(QFileInfo(full).path());
     QFile f(full);
     f.open(QIODevice::WriteOnly);
     f.close();
+    m_revealPath = rel;          // 刷新后展开所在目录并选中这个新文件
+    markDirsExpanded(base);
     refreshStatus();
     m_editorPanel->setPlainText({});
+    m_editorPanel->setLineEnding(QStringLiteral("\n"));   // 新文件统一用 LF
     m_editorStack->setCurrentWidget(m_editorPanel);
+    // 必须把"编辑器"页签切到前面：若当前停在 历史/分支图 页签，
+    // 编辑器内容虽然换了但界面毫无变化，看起来就像什么都没发生
+    ensureTab(m_editorHost, 0, i18n::t("editor"));
     m_editorPanel->setOpenPath(full);
     m_statusLabel->setText(full);
+}
+
+// 新建文件夹。Git 只跟踪文件：空文件夹既不会出现在变更列表里，也不会被提交/推送，
+// 所以建完必须问一句要不要放 .gitkeep 占位，否则用户会遇到"我建的文件夹提交后没了"
+void MainWindow::createFolderDialog() {
+    if (m_currentFile.isEmpty()) return;
+    const QString base = selectedTargetDir();
+    const QString where = base.isEmpty() ? QDir(m_currentFile).dirName() : base;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, i18n::t("new_folder_title"),
+                                               i18n::t("folder_name_label").arg(where),
+                                               QLineEdit::Normal, {}, &ok);
+    if (!ok) return;
+    if (name.trimmed().isEmpty()) return;
+    const QString relName = name.trimmed();
+    const QString rel = base.isEmpty() ? relName : base + QLatin1Char('/') + relName;
+    const QString full = QDir(m_currentFile).filePath(rel);
+    if (!insideRepo(m_currentFile, full)) {
+        QMessageBox::warning(this, i18n::t("hint"), i18n::t("path_outside_repo"));
+        return;
+    }
+    if (QFileInfo::exists(full)) {
+        QMessageBox::warning(this, i18n::t("file_exists"), i18n::t("file_exists_body"));
+        return;
+    }
+    if (!QDir().mkpath(full)) {
+        QMessageBox::warning(this, i18n::t("create_failed"), rel);
+        return;
+    }
+
+    QMessageBox box(this);
+    box.setWindowTitle(i18n::t("new_folder_title"));
+    box.setIcon(QMessageBox::Question);
+    box.setText(i18n::t("empty_folder_hint"));
+    auto *keepBtn = box.addButton(i18n::t("folder_keep_placeholder"), QMessageBox::AcceptRole);
+    auto *emptyBtn = box.addButton(i18n::t("folder_keep_empty"), QMessageBox::RejectRole);
+    box.setDefaultButton(keepBtn);
+    box.exec();
+    if (box.clickedButton() == keepBtn) {
+        QFile f(full + "/.gitkeep");
+        if (f.open(QIODevice::WriteOnly)) f.close();   // 空占位文件
+    } else if (box.clickedButton() != emptyBtn) {
+        return;   // 直接关窗：文件夹已经建好了，只是没放占位文件
+    }
+    m_revealPath = rel;          // 刷新后展开并选中刚建的文件夹（含新放的 .gitkeep）
+    markDirsExpanded(base);
+    refreshStatus();
+    m_statusLabel->setText("✅ " + i18n::t("folder_created").arg(rel));
 }
 
 void MainWindow::showDiffForFile(const QString &path) {
@@ -1123,7 +1441,13 @@ void MainWindow::showDiffForFile(const QString &path) {
         setColoredDiff(m_diffEdit, w->result());
     });
     w->setFuture(QtConcurrent::run([repo, path]() -> QString {
-        try { return git()->diff(repo, path); }
+        try {
+            // 只跑 `git diff` 时，已 git add 的文件（变更在索引里）会得到空输出，
+            // 被误报成"没有差异"。工作区无差异时回退到暂存区差异
+            QString out = git()->diff(repo, path);
+            if (out.isEmpty()) out = git()->diff(repo, path, true);
+            return out.isEmpty() ? i18n::t("no_diff") : out;
+        }
         catch (const std::exception &e) { return QString::fromUtf8(e.what()); }
     }));
 }
@@ -1131,73 +1455,123 @@ void MainWindow::showDiffForFile(const QString &path) {
 void MainWindow::saveCurrentEditor() {
     const QString path = m_editorPanel->openPath();
     if (path.isEmpty()) return;
+    QString text = m_editorPanel->text();
+    // 按原文件的行尾风格写回：编辑器的文本永远是 \n 分行，
+    // 直接落盘会把 CRLF 文件静默改成 LF（反之 QIODevice::Text 会把 LF 改成 CRLF），
+    // 对 Git 客户端来说就是"改一个字符 → 整个文件差异"
+    text.replace(QLatin1String("\r\n"), QLatin1String("\n"));
+    const QString eol = m_editorPanel->lineEnding();
+    if (eol != QLatin1String("\n")) text.replace(QLatin1String("\n"), eol);
     QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return;
-    f.write(m_editorPanel->text().toUtf8());
+    if (!f.open(QIODevice::WriteOnly)) {   // 不要 Text 标志，见上
+        QMessageBox::critical(this, i18n::t("save_failed"),
+                              i18n::t("save_failed_body").arg(path, f.errorString()));
+        return;   // 保留未保存标记：不能让用户以为已经存上了
+    }
+    const QByteArray bytes = text.toUtf8();
+    const qint64 written = f.write(bytes);
+    const bool bad = (written != bytes.size()) || !f.flush() || f.error() != QFileDevice::NoError;
     f.close();
+    if (bad) {
+        // 磁盘满/无权限时 QFile::write 会短写，原文件已经被截断 ——
+        // 不查返回值就会报"已保存"并清掉未保存标记，属于静默丢数据
+        QMessageBox::critical(this, i18n::t("save_failed"),
+                              i18n::t("save_failed_body").arg(path, f.errorString()));
+        return;
+    }
     m_editorPanel->setModified(false);
     m_statusLabel->setText("✅ " + path);
     refreshStatus();
 }
 
 // ─────────────── git ops ───────────────
+// 提交入口（纯提交 / 提交并推送）都要先过大文件闸门：扫描在后台线程跑，绝不阻塞界面
 void MainWindow::commit() {
     const QString msg = m_commitInput->toPlainText().trimmed();
     if (msg.isEmpty()) { QMessageBox::information(this, i18n::t("hint"), i18n::t("enter_commit_msg")); return; }
     if (m_currentFile.isEmpty()) return;
-    m_commitBtn->setEnabled(false);
-    m_commitPushBtn->setEnabled(false);
-    m_statusLabel->setText("⏳ " + i18n::t("committing_local"));
     const QString repo = m_currentFile;
-    auto err = std::make_shared<QString>();
-    auto *w = new QFutureWatcher<bool>(this);
-    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err] {
-        w->deleteLater();
-        m_commitBtn->setEnabled(true);
-        m_commitPushBtn->setEnabled(true);
-        if (!w->result()) {
-            m_statusLabel->setText("❌ " + i18n::t("commit_failed"));
-            QMessageBox::critical(this, i18n::t("commit_failed"), *err);
-            return;
-        }
-        m_commitInput->setPlainText(i18n::t("default_commit_msg"));
-        m_statusLabel->setText("✅ " + i18n::t("commit_success"));
-        m_historyLoadedFor.clear();
-        startRefresh(false, true, false);
-    });
-    w->setFuture(QtConcurrent::run([repo, msg, err]() -> bool {
-        try {
-            git()->commit(repo, msg, {});
-            return true;
-        } catch (const std::exception &e) {
-            *err = QString::fromUtf8(e.what());
-            return false;
-        }
-    }));
+    checkOversizedBeforeCommit(repo, [this, repo, msg] { doCommit(repo, msg, false); });
 }
 
 void MainWindow::commitAndPush() {
     const QString msg = m_commitInput->toPlainText().trimmed();
     if (msg.isEmpty()) { QMessageBox::information(this, i18n::t("hint"), i18n::t("enter_commit_msg")); return; }
     if (m_currentFile.isEmpty()) return;
+    const QString repo = m_currentFile;
+    checkOversizedBeforeCommit(repo, [this, repo, msg] { doCommit(repo, msg, true); });
+}
+
+// 提交前扫描：命中超限文件则一个都不许进入提交；扫描失败不拦（真有问题 git 自己会报错）
+void MainWindow::checkOversizedBeforeCommit(const QString &repo, const std::function<void()> &onClear) {
+    m_commitBtn->setEnabled(false);
+    m_commitPushBtn->setEnabled(false);
+    m_statusLabel->setText("⏳ " + i18n::t("oversized_checking"));
+    auto *w = new QFutureWatcher<QList<OversizedFile>>(this);
+    connect(w, &QFutureWatcher<QList<OversizedFile>>::finished, this, [this, w, onClear] {
+        const QList<OversizedFile> big = w->result();
+        w->deleteLater();
+        // 无论通过与否都要恢复按钮：任何一条分支漏掉都会让界面像卡死
+        m_commitBtn->setEnabled(true);
+        m_commitPushBtn->setEnabled(true);
+        if (big.isEmpty()) {
+            onClear();
+            return;
+        }
+        showCommitBlocked(big);
+    });
+    w->setFuture(QtConcurrent::run([repo]() -> QList<OversizedFile> {
+        try { return git()->findOversizedInCommit(repo); }
+        catch (...) { return {}; }   // 扫描本身出错不阻断提交
+    }));
+}
+
+void MainWindow::showCommitBlocked(const QList<OversizedFile> &files) {
+    QStringList rows;
+    for (const auto &f : files)
+        rows << QStringLiteral("<li><code>%1</code> — %2 MB</li>")
+                    .arg(f.path.toHtmlEscaped(), QString::number(f.sizeMb, 'f', 1));
+    QMessageBox box(this);
+    box.setWindowTitle(i18n::t("commit_blocked_title"));
+    box.setIcon(QMessageBox::Warning);
+    box.setTextFormat(Qt::RichText);
+    box.setText(QStringLiteral("<b>%1</b><ul style='margin:6px 0 6px 18px;'>%2</ul>%3")
+                    .arg(i18n::t("commit_blocked_body"), rows.join(QString()),
+                         i18n::t("commit_blocked_hint")));
+    box.setStandardButtons(QMessageBox::Ok);
+    box.exec();
+    m_statusLabel->setText("\u274c " + i18n::t("commit_blocked_title"));
+}
+
+void MainWindow::doCommit(const QString &repo, const QString &msg, bool thenPush) {
     m_commitBtn->setEnabled(false);
     m_commitPushBtn->setEnabled(false);
     m_statusLabel->setText("⏳ " + i18n::t("committing_local"));
-    const QString repo = m_currentFile;
     auto err = std::make_shared<QString>();
     auto *w = new QFutureWatcher<bool>(this);
-    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err] {
+    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err, thenPush] {
         w->deleteLater();
+        m_commitBtn->setEnabled(true);
+        m_commitPushBtn->setEnabled(true);
         if (!w->result()) {
-            m_commitBtn->setEnabled(true);
-            m_commitPushBtn->setEnabled(true);
+            // 没有可提交的内容：给友好提示，而不是把 git 的英文 hint 原样丢出来
+            if (err->contains(QLatin1String("nothing to commit"), Qt::CaseInsensitive)) {
+                m_statusLabel->setText("\u2139 " + i18n::t("no_changes"));
+                return;
+            }
             m_statusLabel->setText("❌ " + i18n::t("commit_failed"));
             QMessageBox::critical(this, i18n::t("commit_failed"), *err);
             return;
         }
         m_commitInput->setPlainText(i18n::t("default_commit_msg"));
-        // 提交落盘后再推送，避免 push 走的是旧历史
-        push();
+        m_historyLoadedFor.clear();
+        if (thenPush) {
+            // 提交落盘后再推送，避免 push 走的是旧历史
+            push();
+        } else {
+            m_statusLabel->setText("✅ " + i18n::t("commit_success"));
+            startRefresh(false, true, false);
+        }
     });
     w->setFuture(QtConcurrent::run([repo, msg, err]() -> bool {
         try {
@@ -1243,75 +1617,320 @@ void MainWindow::push() {
     if (m_currentFile.isEmpty()) { doPush(); return; }
     const QString repo = m_currentFile;
     auto *w = new QFutureWatcher<QList<OversizedFile>>(this);
-    connect(w, &QFutureWatcher<QList<OversizedFile>>::finished, this, [this, w] {
+    connect(w, &QFutureWatcher<QList<OversizedFile>>::finished, this, [this, w, repo] {
         const QList<OversizedFile> big = w->result();
         w->deleteLater();
         if (big.isEmpty()) { doPush(); return; }
-        // 扫描完成后：所有超限文件直接列在正文（文件名 + 相对路径 + 大小）
-        QString list;
-        for (const auto &f : big)
-            list += QStringLiteral("<li><code>%1</code> — %2 MB</li>")
-                        .arg(f.path.toHtmlEscaped(), QString::number(f.sizeMb, 'f', 1));
+        // 分组：工作区现存 vs 已进历史（删除文件对后者无效，必须重写历史）
+        QStringList curList, histList;
+        for (const auto &f : big) {
+            const QString row = QStringLiteral("<li><code>%1</code> — %2 MB</li>")
+                                    .arg(f.path.toHtmlEscaped(),
+                                         QString::number(f.sizeMb, 'f', 1));
+            if (f.source == QLatin1String("current")) curList << row;
+            else histList << row;
+        }
+        QString body = QStringLiteral("<b>%1</b><br>%2")
+                           .arg(i18n::t("oversized_title"), i18n::t("oversized_body"));
+        if (!curList.isEmpty())
+            body += QStringLiteral("<br><br><b>%3</b><ul style='margin:6px 0 6px 18px;'>%4</ul>%5")
+                        .arg(i18n::t("oversized_cur_group"), curList.join(QString()),
+                             i18n::t("oversized_cur_hint"));
+        if (!histList.isEmpty())
+            body += QStringLiteral("<br><br><b style='color:#e5534b;'>%3</b>"
+                                   "<ul style='margin:6px 0 6px 18px;'>%4</ul>%5")
+                        .arg(i18n::t("oversized_hist_group"), histList.join(QString()),
+                             i18n::t("oversized_hist_hint"));
         QMessageBox box(this);
         box.setWindowTitle(i18n::t("oversized_title"));
         box.setIcon(QMessageBox::Warning);
         box.setTextFormat(Qt::RichText);
-        box.setText(QStringLiteral("<b>%1</b><br>%2<ul style='margin:6px 0 6px 18px;'>%3</ul>")
-                        .arg(i18n::t("oversized_title"),
-                             i18n::t("oversized_body"), list));
-        box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
-        box.button(QMessageBox::Yes)->setText(i18n::t("push_anyway"));
-        box.button(QMessageBox::No)->setText(i18n::t("cancel"));
-        if (box.exec() == QMessageBox::Yes) doPush();
+        box.setText(body);
+        // 历史大文件：给"重写历史清除"一键方案；否则只有 仍要推送/取消
+        QPushButton *purgeBtn = nullptr;
+        QString softAnchor;   // 非空=可走软回退（大文件仅在最近未推送提交中）
+        if (!histList.isEmpty()) {
+            // 判断条件：所有历史大文件的首个提交都在远程已含提交之后
+            //（即大文件只存在于未推送的提交里 → 软回退即可，无需重写历史）
+            QString upstreamBase;
+            try { upstreamBase = git()->run({ "merge-base", "HEAD", "@{u}" }, repo, false); }
+            catch (...) {}
+            // 没有上游（首次推送）时 HEAD 上的一切都还没到远程，软回退同样安全，
+            // 所以基准是"可以软回退"，再由下面的循环把不安全的情况排除掉
+            bool allRecent = true;
+            for (const auto &f : big) {
+                if (f.source != QLatin1String("history")) continue;
+                // isAncestorOrEqual(a,b) = "a 是 b 的祖先"：首提是远程基点的祖先（或就是它）
+                // 说明该大文件早已推送到远程 → 软回退会改写已发布历史，只能重写历史
+                if (f.firstCommit.isEmpty()
+                    || (!upstreamBase.isEmpty()
+                        && git()->isAncestorOrEqual(repo, f.firstCommit, upstreamBase))) {
+                    allRecent = false;
+                    break;
+                }
+            }
+            if (allRecent) {
+                // 锚点取所有大文件 firstCommit 中"最早"的：
+                // 回退必须落在最远那个引入点之前，才能覆盖全部大文件
+                for (const auto &f : big) {
+                    if (f.source != QLatin1String("history")) continue;
+                    if (softAnchor.isEmpty()
+                        || git()->isAncestorOrEqual(repo, f.firstCommit, softAnchor))
+                        softAnchor = f.firstCommit;
+                }
+                if (softAnchor.isEmpty()) allRecent = false;   // 理论不可达（firstCommit 均非空才走到这）
+            }
+            purgeBtn = box.addButton(i18n::t(softAnchor.isEmpty() ? "oversized_purge_btn"
+                                                                  : "oversized_soft_btn"),
+                                     QMessageBox::DestructiveRole);
+        }
+        auto *anywayBtn = box.addButton(i18n::t("push_anyway"), QMessageBox::YesRole);
+        box.addButton(QMessageBox::Cancel);
+        box.exec();
+        const QAbstractButton *clicked = box.clickedButton();
+        if (clicked == purgeBtn) {
+            if (!softAnchor.isEmpty()) {
+                // 软回退：确认文案更温和（不重写历史，不产生 force push）
+                if (QMessageBox::question(this, i18n::t("oversized_soft_btn"),
+                                          i18n::t("oversized_soft_confirm")) == QMessageBox::Yes)
+                    softResetPurgeAndPush(repo, big, softAnchor);
+            } else {
+                purgeOversizedHistory(repo, big);
+            }
+            return;
+        }
+        if (clicked == anywayBtn) doPush();
     });
-    w->setFuture(QtConcurrent::run([repo] { return git()->findOversizedFiles(repo); }));
+    // 工作函数必须自己兜住异常：QFuture::result() 在任务抛出时会重新抛出，
+    // 而异常从槽里逃逸等于 std::terminate（git 起不来/超时就会走到这里）
+    w->setFuture(QtConcurrent::run([repo]() -> QList<OversizedFile> {
+        try { return git()->findOversizedFiles(repo); }
+        catch (...) { return {}; }   // 扫不了就放行，push 自己会报真正的错
+    }));
 }
 
+// 软回退清理（大文件仅在最近未推送提交中）：回退到锚点父提交→剔除大文件→
+// 之后的改动重新打包为一个提交→自动继续推送。秒级完成，不改更早历史。
+void MainWindow::softResetPurgeAndPush(const QString &repo, const QList<OversizedFile> &big,
+                                        const QString &anchor) {
+    QList<OversizedFile> hist;
+    for (const auto &f : big)
+        if (f.source == QLatin1String("history")) hist << f;
+    m_statusLabel->setText("⏳ " + i18n::t("oversized_purging"));
+    m_commitBtn->setEnabled(false);
+    m_commitPushBtn->setEnabled(false);
+    auto err = std::make_shared<QString>();
+    auto *w = new QFutureWatcher<bool>(this);
+    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err, repo] {
+        w->deleteLater();
+        m_commitBtn->setEnabled(true);
+        m_commitPushBtn->setEnabled(true);
+        if (!w->result()) {
+            m_statusLabel->setText("❌ " + i18n::t("oversized_purge_failed"));
+            QMessageBox::critical(this, i18n::t("oversized_soft_btn"), *err);
+            return;
+        }
+        m_statusLabel->setText("✅ " + i18n::t("oversized_purged"));
+        m_historyLoadedFor.clear();
+        refreshStatus();
+        push();   // 干净了，自动回到推送流程
+    });
+    w->setFuture(QtConcurrent::run([repo, hist, anchor, err]() -> bool {
+        try {
+            const QString e = git()->softResetPurge(repo, hist, anchor);
+            *err = e;
+            return e.isEmpty();
+        } catch (const std::exception &e) {
+            *err = QString::fromUtf8(e.what());
+            return false;
+        }
+    }));
+}
+
+// 一键重写历史剥除大文件：filter-branch + reflog/gc 回收，完成后重扫并继续推送
+void MainWindow::purgeOversizedHistory(const QString &repo, const QList<OversizedFile> &big) {
+    QList<OversizedFile> hist;
+    QStringList paths;
+    for (const auto &f : big)
+        if (f.source == QLatin1String("history")) { hist << f; paths << f.path; }
+    if (hist.isEmpty()) { doPush(); return; }
+    // 强确认：重写不可逆、提交哈希全变、已推送的仓库会分叉
+    QMessageBox box(this);
+    box.setWindowTitle(i18n::t("oversized_purge_btn"));
+    box.setIcon(QMessageBox::Warning);
+    box.setTextFormat(Qt::RichText);
+    box.setText(i18n::t("oversized_purge_confirm").arg(paths.join(", ")));
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+    box.setDefaultButton(QMessageBox::No);
+    if (box.exec() != QMessageBox::Yes) return;
+
+    m_statusLabel->setText("⏳ " + i18n::t("oversized_purging"));
+    m_commitBtn->setEnabled(false);
+    m_commitPushBtn->setEnabled(false);
+    auto err = std::make_shared<QString>();
+    auto *w = new QFutureWatcher<bool>(this);
+    connect(w, &QFutureWatcher<bool>::finished, this, [this, w, err, repo] {
+        w->deleteLater();
+        m_commitBtn->setEnabled(true);
+        m_commitPushBtn->setEnabled(true);
+        if (!w->result()) {
+            m_statusLabel->setText("❌ " + i18n::t("oversized_purge_failed"));
+            QMessageBox::critical(this, i18n::t("oversized_purge_btn"), *err);
+            return;
+        }
+        m_statusLabel->setText("✅ " + i18n::t("oversized_purged"));
+        m_historyLoadedFor.clear();
+        refreshStatus();
+        // 清理完成自动回到推送流程（此时应无大文件，直接进入确认/doPush）
+        push();
+    });
+    w->setFuture(QtConcurrent::run([repo, hist, err]() -> bool {
+        try {
+            const QString e = git()->purgeFilesFromHistory(repo, hist);
+            *err = e;
+            return e.isEmpty();
+        } catch (const std::exception &e) {   // 别让异常逃到 QFuture::result()
+            *err = QString::fromUtf8(e.what());
+            return false;
+        }
+    }));
+}
+
+// 推送三阶段：① fetch 检测远程分叉 → ② 需要时引导变基整合 → ③ 真正推送。
+// 之前直接 push，远程有新提交（网页端改动/其他设备）时被拒，用户只看到 git 原文。
 void MainWindow::doPush() {
     if (m_pushProcess) { delete m_pushProcess; m_pushProcess = nullptr; }
-
     const Account a = acct()->currentAccount();
+    // git 起不来时 finished 永不触发，进度弹窗会永久挂在屏幕上（无任何反馈）
+    if (git()->gitPath().isEmpty()) {
+        m_statusLabel->setText("\u274c " + i18n::t("push_failed"));
+        QMessageBox::critical(this, i18n::t("push_failed"), i18n::t("git_not_found"));
+        return;
+    }
+
+    m_progressDlg = new ProgressDialog(i18n::t("pushing"), this);
+    m_progressDlg->show();
+    m_progressDlg->raise();
+    m_progressDlg->activateWindow();
+
+    // ── 阶段①：fetch（失败如离线则忽略，交给 push 自行报错）──
+    auto *fetch = new QProcess(this);
+    fetch->setProcessEnvironment(GitService::askpassEnv(a.token, a.username));
+    fetch->setWorkingDirectory(m_currentFile);
+    connect(fetch, &QProcess::errorOccurred, this, [this](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart) return;   // 起不来才处理，其余交给 finished
+        if (m_progressDlg) { m_progressDlg->deleteLater(); m_progressDlg = nullptr; }
+        m_statusLabel->setText("\u274c " + i18n::t("push_failed"));
+        QMessageBox::critical(this, i18n::t("push_failed"), i18n::t("git_not_found"));
+    });
+    connect(fetch, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, fetch, a](int code, QProcess::ExitStatus) {
+        fetch->deleteLater();
+        if (code != 0) { startPushProcess(a); return; }
+        // ── 阶段②：统计远程领先的提交数 ──
+        auto *cnt = new QProcess(this);
+        cnt->setProcessEnvironment(GitService::askpassEnv(a.token, a.username));
+        cnt->setWorkingDirectory(m_currentFile);
+        connect(cnt, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+                [this, cnt, a](int, QProcess::ExitStatus) {
+            cnt->deleteLater();
+            const int behind = QString::fromUtf8(cnt->readAllStandardOutput())
+                                   .trimmed().toInt();
+            if (behind <= 0) { startPushProcess(a); return; }
+            // ── 阶段②b：远程有新提交，引导变基整合 ──
+            if (m_progressDlg) { m_progressDlg->deleteLater(); m_progressDlg = nullptr; }
+            QMessageBox box(this);
+            box.setWindowTitle(i18n::t("pushing"));
+            box.setIcon(QMessageBox::Warning);
+            box.setText(i18n::t("remote_ahead_msg").arg(behind));
+            auto *rebaseBtn = box.addButton(i18n::t("btn_rebase_push"), QMessageBox::YesRole);
+            box.addButton(QMessageBox::Cancel);
+            box.exec();
+            if (box.clickedButton() != rebaseBtn) {
+                onPushFailed(i18n::t("push_cancelled_by_user"));
+                return;
+            }
+            auto *reb = new QProcess(this);
+            reb->setProcessEnvironment(GitService::askpassEnv(a.token, a.username));
+            reb->setWorkingDirectory(m_currentFile);
+            connect(reb, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+                    [this, reb, a](int code, QProcess::ExitStatus) {
+                const QString reErr = QString::fromUtf8(reb->readAllStandardError());
+                reb->deleteLater();
+                if (code != 0) {
+                    if (m_progressDlg) { m_progressDlg->deleteLater(); m_progressDlg = nullptr; }
+                    // 变基失败后仓库停在 rebase 中间态：不提供出口的话，
+                    // 之后的提交/切分支全会失败，用户只能去命令行自救
+                    QMessageBox box(this);
+                    box.setWindowTitle(i18n::t("rebase_failed"));
+                    box.setIcon(QMessageBox::Warning);
+                    box.setText(i18n::t("rebase_failed") + "\n\n" + reErr.left(1500)
+                                + "\n\n" + i18n::t("rebase_abort_hint"));
+                    auto *abortBtn = box.addButton(i18n::t("rebase_abort_btn"), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Cancel);
+                    box.exec();
+                    if (box.clickedButton() == abortBtn) {
+                        try {
+                            git()->run({ "rebase", "--abort" }, m_currentFile, true, 60000);
+                            refreshStatus();
+                            onPushFailed(i18n::t("rebase_failed") + "\n\n"
+                                         + i18n::t("rebase_aborted"));
+                        } catch (const std::exception &e) {
+                            onPushFailed(QString::fromUtf8(e.what()));
+                        }
+                        return;
+                    }
+                    onPushFailed(i18n::t("rebase_failed") + "\n\n" + reErr);
+                    return;
+                }
+                startPushProcess(a);
+            });
+            reb->start(git()->gitPath(), { "pull", "--rebase" });
+        });
+        cnt->start(git()->gitPath(), { "rev-list", "--count", "HEAD..@{u}" });
+    });
+    fetch->start(git()->gitPath(), { "fetch", "--progress", "origin" });
+}
+
+// 阶段③：真正执行 push（进度弹窗/实时日志/失败诊断）
+void MainWindow::startPushProcess(const Account &a) {
+    if (m_pushProcess) { delete m_pushProcess; m_pushProcess = nullptr; }
+    if (m_progressDlg) { m_progressDlg->deleteLater(); m_progressDlg = nullptr; }
+
     m_pushProcess = new QProcess(this);
-    QProcessEnvironment pe = QProcessEnvironment::systemEnvironment();
-    pe.insert("GIT_TERMINAL_PROMPT", "0");
-    // askpass：Token 走环境变量（不写脚本明文），对特殊字符也安全
-    const QString dir = QDir::tempPath() + "/gitflow_auth";
-    QDir().mkpath(dir);
-    const QString bat = dir + "/askpass.cmd";
-    { QFile f(bat); if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QTextStream ts(&f);
-        ts << "@echo off\r\necho %~1 | findstr /I \"Username\" >nul\r\n";
-        ts << "if not errorlevel 1 (echo %GF_USER%) else (echo %GF_TOKEN%)\r\n"; } }
-    pe.insert("GIT_ASKPASS", bat);
-    pe.insert("GF_TOKEN", a.token);
-    pe.insert("GF_USER", a.username.isEmpty() ? QStringLiteral("oauth2") : a.username);
-    // 禁用 GCM 交互，避免弹出 GitHub 登录窗口抢走 Token 认证
-    pe.insert("GCM_INTERACTIVE", "Never");
-    pe.insert("GCM_GUI_PROMPT", "Never");
-    // 代理
-    const QString proxy = proxy::detectSystemProxy();
-    if (!proxy.isEmpty()) { pe.insert("HTTPS_PROXY", proxy); pe.insert("HTTP_PROXY", proxy); }
-    m_pushProcess->setProcessEnvironment(pe);
+    m_pushProcess->setProcessEnvironment(GitService::askpassEnv(a.token, a.username));
     m_pushProcess->setWorkingDirectory(m_currentFile);
     // 进度弹窗：实时展示推送百分比/阶段，卡住检测
     m_progressDlg = new ProgressDialog(i18n::t("pushing"), this);
     m_progressDlg->show();
     m_progressDlg->raise();
     m_progressDlg->activateWindow();
-    connect(m_pushProcess, &QProcess::readyReadStandardError, this, [this] {
-        const QStringList lines = QString::fromUtf8(m_pushProcess->readAllStandardError())
+    // 一律用捕获的 proc：m_pushProcess 可能已被下一轮推送替换，用成员会读到错误的进程
+    auto *proc = m_pushProcess;
+    connect(proc, &QProcess::readyReadStandardError, this, [this, proc] {
+        // git --progress 的进度行用 \r 原地刷新（一"行"里叠几十次更新），
+        // 只按 \n 切会把它们串成一条，百分比取到的还是块里最早的值
+        const QStringList lines = QString::fromUtf8(proc->readAllStandardError())
+                                      .replace(QLatin1Char('\r'), QLatin1Char('\n'))
                                       .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
         for (const QString &l : lines) onPushProgressLine(l.trimmed());
     });
-    connect(m_pushProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus) {
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
+        if (err != QProcess::FailedToStart || proc != m_pushProcess) return;
+        if (m_progressDlg) { m_progressDlg->deleteLater(); m_progressDlg = nullptr; }
+        m_statusLabel->setText("\u274c " + i18n::t("push_failed"));
+        QMessageBox::critical(this, i18n::t("push_failed"), i18n::t("git_not_found"));
+    });
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, proc](int code, QProcess::ExitStatus) {
+        if (proc != m_pushProcess) return;   // 过期进程，忽略
         if (code == 0) onPushFinished();
-        else onPushFailed(QString::fromUtf8(m_pushProcess->readAllStandardError()));
+        else onPushFailed(QString::fromUtf8(proc->readAllStandardError()));
     });
     // credential.helper 置空：强制走 askpass（应用内 Token）；-u 首推自动建立上游跟踪
-    m_pushProcess->start(git()->gitPath(),
-                         { "-c", "http.version=HTTP/1.1", "-c", "credential.helper=",
-                           "push", "-u", "origin", "--progress" });
+    proc->start(git()->gitPath(),
+                { "-c", "http.version=HTTP/1.1", "-c", "credential.helper=",
+                  "push", "-u", "origin", "--progress" });
 }
 
 // ─────────────── push 进度槽 ───────────────
@@ -1330,18 +1949,24 @@ void MainWindow::onPushFinished() {
 }
 
 void MainWindow::onPushFailed(const QString &err) {
-    if (m_progressDlg) { m_progressDlg->finishFail(err, GitService::diagnoseNetwork()); m_progressDlg = nullptr; }
+    // 兜底翻译：极端时序下仍可能被拒（fetch 后远程又变），把 git 原文换成行动指引
+    QString friendly = err;
+    if (err.contains(QLatin1String("fetch first"), Qt::CaseInsensitive)
+        || err.contains(QLatin1String("[rejected]"))
+        || err.contains(QLatin1String("non-fast-forward"), Qt::CaseInsensitive))
+        friendly = i18n::t("push_fetch_first") + QStringLiteral("\n\n") + err;
+    if (m_progressDlg) { m_progressDlg->finishFail(friendly, GitService::diagnoseNetwork()); m_progressDlg = nullptr; }
     m_statusLabel->setText("\u274c " + i18n::t("push_failed"));
     m_commitBtn->setEnabled(true);
     m_commitPushBtn->setEnabled(true);
 }
-
 void MainWindow::deleteSelectedFile() {
     auto *item = m_changeTree->currentItem();
     if (!item || m_currentFile.isEmpty()) return;
     const QString path = item->data(0, Qt::UserRole).toString();
     if (path.isEmpty()) return;
-    if (QMessageBox::question(this, "GitFlow", i18n::t("confirm_delete").arg(path)) != QMessageBox::Yes) return;
+    if (QMessageBox::question(this, i18n::t("confirm_delete"),
+                              i18n::t("delete_q").arg(path)) != QMessageBox::Yes) return;
     try { git()->deleteFile(m_currentFile, path); refreshStatus(); refreshHistory(); }
     catch (const std::exception &e) { QMessageBox::critical(this, i18n::t("delete_failed"), e.what()); }
 }
@@ -1351,84 +1976,191 @@ void MainWindow::restoreSelectedFile() {
     if (!item || m_currentFile.isEmpty()) return;
     const QString path = item->data(0, Qt::UserRole).toString();
     if (path.isEmpty()) return;
-    if (QMessageBox::question(this, "GitFlow", i18n::t("discard_changes").arg(path)) != QMessageBox::Yes) return;
+    // 未跟踪文件没有"修改前状态"可恢复（git restore 会直接报 pathspec 不匹配），
+    // 放弃它的修改只有一种含义：把文件删掉
+    if (item->data(0, Qt::UserRole + 1).toInt() == int(GitFileStatus::Untracked)) {
+        if (QMessageBox::question(this, i18n::t("discard_changes"),
+                                  i18n::t("discard_untracked_q").arg(path)) != QMessageBox::Yes) return;
+        if (!QFile::remove(QDir(m_currentFile).filePath(path)))
+            QMessageBox::critical(this, i18n::t("delete_failed"), path);
+        refreshStatus();
+        return;
+    }
+    if (QMessageBox::question(this, i18n::t("discard_changes"),
+                              i18n::t("discard_q").arg(path)) != QMessageBox::Yes) return;
     try { git()->restore(m_currentFile, path); refreshStatus(); }
     catch (const std::exception &e) { QMessageBox::critical(this, i18n::t("restore_failed"), e.what()); }
 }
 
 void MainWindow::switchBranch(const QString &name) {
-    if (name.isEmpty() || m_currentFile.isEmpty()) return;
-    try { git()->switchBranch(m_currentFile, name); refreshStatus(); refreshHistory(); }
-    catch (const std::exception &e) { QMessageBox::critical(this, i18n::t("switch_failed"), e.what()); }
+    // "(detached)" 是分离头指针时我们塞进下拉框的展示项，不是真分支
+    if (name.isEmpty() || name == QLatin1String("HEAD") || name == QLatin1String("(detached)")
+        || m_currentFile.isEmpty())
+        return;
+    try {
+        git()->switchBranch(m_currentFile, name);
+        refreshStatus(); refreshHistory();
+    } catch (const std::exception &e) {
+        QMessageBox::critical(this, i18n::t("switch_failed"), e.what());
+        // 切换失败（未提交改动、分支不存在等）时下拉框已经被用户改成目标分支了，
+        // 不移回来它就会一直显示一个并没有生效的分支
+        m_branchCombo->blockSignals(true);
+        m_branchCombo->setCurrentText(m_currentBranch);
+        m_branchCombo->blockSignals(false);
+    }
 }
 
 void MainWindow::createBranchDialog() {
+    if (m_currentFile.isEmpty()) return;
     bool ok = false;
     const QString name = QInputDialog::getText(this, i18n::t("new_branch_t"),
                                                i18n::t("branch_name"), QLineEdit::Normal, {}, &ok);
     if (!ok || name.trimmed().isEmpty()) return;
-    git()->createBranch(m_currentFile, name.trimmed());
-    refreshBranches();
+    // git 失败会抛异常：槽函数里逃逸的异常会直接终止进程（重名分支是常见误操作）
+    try {
+        git()->createBranch(m_currentFile, name.trimmed());
+        m_statusLabel->setText("✅ " + i18n::t("branch_created").arg(name.trimmed()));
+        refreshBranches();
+    } catch (const std::exception &e) {
+        QMessageBox::critical(this, i18n::t("switch_failed"), e.what());
+    }
 }
 
 void MainWindow::stashSave() {
+    if (m_currentFile.isEmpty()) return;
     bool ok = false;
     const QString msg = QInputDialog::getText(this, i18n::t("menu.stash_save"),
                                               i18n::t("stash_hint"), QLineEdit::Normal, {}, &ok);
     if (!ok) return;
-    git()->stashSave(m_currentFile, msg);
-    m_statusLabel->setText("✅ " + i18n::t("stash_ok"));
-    refreshStatus();
+    try {
+        const auto r = git()->stashSave(m_currentFile, msg);
+        // "No local changes to save" 退出码是 0：以前这里会照报"已暂存"
+        if (r.nothing) {
+            m_statusLabel->setText("ℹ " + i18n::t("stash_nothing"));
+            return;
+        }
+        if (!r.ok) {
+            m_statusLabel->setText("❌ " + i18n::t("stash_failed"));
+            QMessageBox::critical(this, i18n::t("stash_failed"), r.message);
+            return;
+        }
+        m_statusLabel->setText("✅ " + i18n::t("stash_ok"));
+        refreshStatus();
+    } catch (const std::exception &e) {
+        QMessageBox::critical(this, i18n::t("stash_failed"), e.what());
+    }
 }
 
 void MainWindow::stashPop() {
-    git()->stashPop(m_currentFile);
-    m_statusLabel->setText("✅ " + i18n::t("stash_popped_t"));
-    refreshStatus();
+    if (m_currentFile.isEmpty()) return;
+    try {
+        const auto r = git()->stashPop(m_currentFile);
+        if (!r.ok) {
+            // 弹出遇冲突时改动已带标记进工作区、stash 未被删除：
+            // 以前这里无条件报"✅ 已弹出"，用户以为成功、一提交才发现全是冲突
+            m_statusLabel->setText(r.conflict ? "⚠ " + i18n::t("stash_conflict")
+                                              : "❌ " + i18n::t("pop_failed"));
+            QMessageBox::warning(this, r.conflict ? i18n::t("stash_conflict") : i18n::t("pop_failed"),
+                                 r.message);
+            refreshStatus();
+            return;
+        }
+        m_statusLabel->setText("✅ " + i18n::t("stash_popped_t"));
+        refreshStatus();
+    } catch (const std::exception &e) {
+        QMessageBox::critical(this, i18n::t("pop_failed"), e.what());
+    }
 }
 
 void MainWindow::showStashList() {
-    const auto stashes = git()->stashList(m_currentFile);
-    if (stashes.isEmpty()) { QMessageBox::information(this, i18n::t("stash_list_t"), i18n::t("no_stash")); return; }
+    if (m_currentFile.isEmpty()) return;
     QDialog dlg(this);
     dlg.setWindowTitle(i18n::t("stash_list_t"));
-    dlg.setMinimumWidth(480);
+    dlg.setMinimumSize(520, 380);
     auto *layout = new QVBoxLayout(&dlg);
     layout->addWidget(new QLabel(i18n::t("stash_del_hint")));
     auto *list = new QListWidget;
-    for (const auto &s : stashes)
-        list->addItem(s.ref + "  " + s.subject);
-    layout->addWidget(list);
-    layout->addWidget(new QLabel(i18n::t("stash_del_hint")));
+    layout->addWidget(list, 1);
+    const std::function<void()> reload = [this, list] {
+        list->clear();
+        for (const auto &s : git()->stashList(m_currentFile))
+            list->addItem(s.ref + "  " + s.subject);
+    };
+    reload();
+    // 文案承诺"双击可删除"，这里把行为补齐（此前提示与实现不一致，双击无任何反应）
+    if (list->count() == 0) {
+        list->addItem(i18n::t("no_stash"));
+    } else {
+        connect(list, &QListWidget::itemDoubleClicked, &dlg,
+                [this, list, reload](QListWidgetItem *it) {
+            const QString ref = it->text().section(' ', 0, 0);
+            if (QMessageBox::question(this, i18n::t("delete_stash"),
+                                      i18n::t("delete_q").arg(ref)) != QMessageBox::Yes) return;
+            try {
+                git()->stashDrop(m_currentFile, ref);
+                reload();
+            } catch (const std::exception &e) {
+                QMessageBox::critical(this, i18n::t("delete_stash"), e.what());
+            }
+        });
+    }
+    auto *closeBtn = new QPushButton(i18n::t("close"));
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    layout->addWidget(closeBtn, 0, Qt::AlignRight);
     dlg.exec();
+    refreshStatus();
 }
 
 void MainWindow::createTagDialog() {
+    if (m_currentFile.isEmpty()) return;
     bool ok = false;
     const QString name = QInputDialog::getText(this, i18n::t("menu.tag_create"),
                                                i18n::t("tag_name"), QLineEdit::Normal, {}, &ok);
     if (!ok || name.trimmed().isEmpty()) return;
-    git()->createTag(m_currentFile, name.trimmed());
-    m_statusLabel->setText("✅ " + i18n::t("tag_created"));
+    try {
+        git()->createTag(m_currentFile, name.trimmed());
+        m_statusLabel->setText("✅ " + i18n::t("tag_created"));
+    } catch (const std::exception &e) {
+        QMessageBox::critical(this, i18n::t("tag_created"), e.what());
+    }
 }
 
 void MainWindow::showTagList() {
-    const QStringList tags = git()->tags(m_currentFile);
+    if (m_currentFile.isEmpty()) return;
     QDialog d(this);
     d.setWindowTitle(i18n::t("tag_list_t"));
-    d.setMinimumSize(420, 360);
+    d.setMinimumSize(420, 380);
     auto *v = new QVBoxLayout(&d);
-    auto *lbl = new QLabel(tags.isEmpty() ? i18n::t("no_results")
-                                          : QStringLiteral("%1: %2").arg(i18n::t("tag_list_t")).arg(tags.size()));
-    lbl->setStyleSheet(QString("color:%1;").arg(theme::textMuted()));
-    v->addWidget(lbl);
     auto *list = new QListWidget;
     list->setFont(QFont("Consolas", 10));
-    if (tags.isEmpty())
-        list->addItem(i18n::t("no_results"));
-    else
-        list->addItems(tags);
+    auto *lbl = new QLabel;
+    lbl->setStyleSheet(QString("color:%1;").arg(theme::textMuted()));
+    // 与 Stash 列表同款：文案承诺"双击可删除"，行为就得真的在
+    // （此前 GitService::deleteTag 完全没有入口，标签只能建不能删）
+    const std::function<void()> reload = [this, list, lbl] {
+        list->clear();
+        const QStringList tags = git()->tags(m_currentFile);
+        if (tags.isEmpty()) list->addItem(i18n::t("no_tags"));
+        else list->addItems(tags);
+        lbl->setText(QStringLiteral("%1: %2").arg(i18n::t("tag_list_t")).arg(tags.size()));
+    };
+    reload();
+    v->addWidget(lbl);
     v->addWidget(list, 1);
+    v->addWidget(new QLabel(i18n::t("tag_del_hint")));
+    connect(list, &QListWidget::itemDoubleClicked, &d, [this, list, reload](QListWidgetItem *it) {
+        const QString name = it->text();
+        if (name.isEmpty() || name == i18n::t("no_tags")) return;
+        if (QMessageBox::question(this, i18n::t("delete_tag"),
+                                  i18n::t("delete_tag_q").arg(name)) != QMessageBox::Yes) return;
+        try {
+            git()->deleteTag(m_currentFile, name);
+            reload();
+            m_statusLabel->setText("✅ " + i18n::t("deleted") + ": " + name);
+        } catch (const std::exception &e) {
+            QMessageBox::critical(this, i18n::t("delete_tag"), e.what());
+        }
+    });
     auto *closeBtn = new QPushButton(i18n::t("close"));
     connect(closeBtn, &QPushButton::clicked, &d, &QDialog::accept);
     v->addWidget(closeBtn, 0, Qt::AlignRight);
@@ -1500,6 +2232,13 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *e) {
             applyImageZoom();
             showImageZoomToast();
             return true;
+        } else if (e->type() == QEvent::Resize) {
+            // "适应窗口"=1.0 是按控件尺寸算的：窗口/分隔条变化后必须重算，
+            // 否则图片会停留在旧比例（放大后拖小窗口就会溢出）。
+            // 但缩放一张大图不便宜，而拖拽窗口会连续产生大量 Resize 事件，
+            // 所以做 60ms 去抖：停下来之后再算一次，别让拖拽变成幻灯片
+            if (m_imageFitTimer) m_imageFitTimer->start(60);
+            else applyImageZoom();
         }
     }
     return QMainWindow::eventFilter(obj, e);
@@ -1517,64 +2256,238 @@ void MainWindow::showLoading(bool on) {
     }
 }
 
-// 拖拽：文件夹 = 打开项目；文件 = 复制进当前仓库并暂存（配合提交按钮）
+// 拖拽：文件夹 = 打开项目（未开仓库时）/ 递归合并进仓库（已开仓库）；文件 = 复制/替换并暂存
 void MainWindow::dragEnterEvent(QDragEnterEvent *e) {
     if (!e->mimeData()->hasUrls()) return;
     for (const QUrl &u : e->mimeData()->urls()) {
         const QFileInfo fi(u.toLocalFile());
         if (fi.isDir() || fi.isFile()) {
             e->acceptProposedAction();
+            if (!m_hoverStatusSaved) {   // 首次进入时记住原文案，供离开/松手后还原
+                m_statusBeforeHover = m_statusLabel->text();
+                m_hoverStatusSaved = true;
+            }
             m_statusLabel->setText("\U0001F4C2 " + i18n::t("drag_drop_hint"));
             return;
         }
     }
 }
 
+// 拖到窗口后又拖走/取消：把状态栏还原，否则提示会一直挂到下一次操作
+void MainWindow::dragLeaveEvent(QDragLeaveEvent *e) {
+    QMainWindow::dragLeaveEvent(e);
+    if (!m_hoverStatusSaved) return;
+    m_statusLabel->setText(m_statusBeforeHover);
+    m_hoverStatusSaved = false;
+}
+
+// 询问"目标已存在，是否替换"。调用方维护 apply-all 状态（本次拖拽内记住选择）
+// 目标已存在时询问"是否替换"。整次拖拽**只问一次**：第一次的选择就作为本次
+// 全部同名文件的策略（由调用方记进 mode），因此只需要"替换 / 跳过"两个选项 ——
+// 再多出"全部替换/全部跳过"就与它们完全等价了
+enum class DropReplace { Ask, Yes, No };
+
+DropReplace askReplace(QWidget *parent, const QString &name) {
+    QMessageBox box(parent);
+    box.setWindowTitle(i18n::t("drop_replace_title"));
+    box.setIcon(QMessageBox::Question);
+    box.setText(i18n::t("drop_replace_msg").arg(name));
+    auto *yes = box.addButton(i18n::t("drop_replace_yes"), QMessageBox::YesRole);
+    box.addButton(i18n::t("drop_replace_no"), QMessageBox::NoRole);
+    box.exec();
+    // 关窗/按 Esc 一律按"跳过"处理（不覆盖是更安全的一侧）
+    return box.clickedButton() == yes ? DropReplace::Yes : DropReplace::No;
+}
+
+// Windows QFile::copy 不能覆盖已存在文件；替换 = 删旧 + 拷新。目标目录不存在时自动创建
+bool replaceOrCopyFile(const QString &src, const QString &dst) {
+    const QString dstDir = QFileInfo(dst).absolutePath();
+    if (!QFileInfo::exists(dstDir) && !QDir().mkpath(dstDir)) return false;
+    if (QFile::exists(dst) && !QFile::remove(dst)) return false;
+    if (QFile::copy(src, dst)) return true;
+    return false;
+}
+
 void MainWindow::dropEvent(QDropEvent *e) {
     if (!e->mimeData()->hasUrls()) return;
-    QStringList dirs, files;
+    e->acceptProposedAction();
+    QStringList paths;
     for (const QUrl &u : e->mimeData()->urls()) {
         const QString local = u.toLocalFile();
-        if (local.isEmpty()) continue;
+        if (!local.isEmpty()) paths << local;
+    }
+    importIntoRepo(paths, {});   // 落在窗口空白处 = 仓库根
+}
+
+// 把外部文件/文件夹导入仓库的 baseRel 目录（空串=仓库根）。
+// 窗口拖放与"拖到文件树某个目录节点上"共用这一份实现
+void MainWindow::importIntoRepo(const QStringList &paths, const QString &baseRel) {
+    QStringList dirs, files;
+    for (const QString &local : paths) {
         if (QFileInfo(local).isDir()) dirs << local;
         else files << local;
     }
-    e->acceptProposedAction();
-    if (files.isEmpty() && !dirs.isEmpty()) { openRepo(dirs.first()); return; }
-    if (files.isEmpty()) return;
-
     if (m_currentFile.isEmpty()) {
+        // 没打开仓库：拖文件夹 = 打开项目（老行为）
+        if (files.isEmpty() && !dirs.isEmpty()) { openRepo(dirs.first()); return; }
         QMessageBox::information(this, i18n::t("hint"), i18n::t("no_project"));
         return;
     }
-    // 仓库内文件直接暂存；仓库外的复制进仓库根目录后暂存
+
     const QDir root(m_currentFile);
     const QString rootAbs = root.absolutePath() + '/';
-    QStringList staged, skipped;
+    QStringList staged, skipped, moved;
+    DropReplace mode = DropReplace::Ask;   // 本次拖拽内对"已存在"的统一选择
+    // 目标目录前缀：拖到子目录时所有落点都要带上它
+    auto withBase = [&baseRel](const QString &rel) {
+        if (baseRel.isEmpty()) return rel;
+        return rel.isEmpty() ? baseRel : baseRel + QLatin1Char('/') + rel;
+    };
+
+    // ── ① 先只枚举（纯目录遍历，不读文件内容）：列出 (源文件, 目标相对路径) ──
+    // 目录里有多少文件，枚举完成前是不知道的；大目录上这一步本身就要几秒，
+    // 所以只要拖了文件夹就先亮出忙碌进度窗，并周期性处理事件，别让界面假死。
+    // （只拖文件时 files 已是平坦列表，枚举是瞬时的，无需打扰用户）
+    std::unique_ptr<QProgressDialog> prog;
+    if (!dirs.isEmpty()) {
+        prog = std::make_unique<QProgressDialog>(i18n::t("import_scanning"), QString(), 0, 0, this);
+        prog->setWindowTitle(i18n::t("import_title"));
+        prog->setWindowModality(Qt::ApplicationModal);
+        prog->setMinimumDuration(0);
+        prog->setCancelButton(nullptr);   // 枚举阶段不做取消，避免留下半途状态
+        prog->show();
+    }
+    struct Plan { QString src, relInBase; };
+    QList<Plan> plan;
+    qint64 totalBytes = 0;
+    int scanned = 0;
+    auto tick = [&] {
+        if (prog && ++scanned % 500 == 0)
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    };
     for (const QString &f : files) {
         const QFileInfo fi(f);
+        plan.append({ f, fi.fileName() });
+        totalBytes += fi.size();
+        tick();
+    }
+    for (const QString &d : dirs) {
+        const QString folderName = QFileInfo(d).fileName();
+        QDirIterator it(d, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString abs = it.next();
+            plan.append({ abs, folderName + QLatin1Char('/') + QDir(d).relativeFilePath(abs) });
+            totalBytes += it.fileInfo().size();
+            tick();
+        }
+    }
+    if (prog) { prog->close(); prog.reset(); }
+    if (plan.isEmpty()) {
+        m_statusLabel->setText("⚠ " + i18n::t("dropped_none"));
+        return;
+    }
+
+    // ── ② 量大的才弹可取消的进度窗（小批量不打扰）。QProgressDialog 的 setValue
+    //    会处理事件，窗口保持响应、可以中途取消，不会变成"无响应" ──
+    if (plan.size() > 50 || totalBytes > 64LL * 1024 * 1024) {
+        prog = std::make_unique<QProgressDialog>(
+            i18n::t("importing").arg(plan.size()), i18n::t("cancel"), 0, int(plan.size()), this);
+        prog->setWindowTitle(i18n::t("import_title"));
+        prog->setWindowModality(Qt::ApplicationModal);
+        prog->setMinimumDuration(0);
+        prog->setAutoClose(false);
+        prog->setAutoReset(false);
+        prog->show();
+    }
+
+    // 单文件处理：仓库内的不做移动；仓库外的复制/替换到目标目录
+    auto handleFile = [&](const QString &absSrc, const QString &relInBase) {
+        const QFileInfo fi(absSrc);
         QString rel;
-        if (fi.absoluteFilePath().startsWith(rootAbs)) {
-            rel = root.relativeFilePath(fi.absoluteFilePath());
+        if (fi.absoluteFilePath().startsWith(rootAbs, Qt::CaseInsensitive)) {
+            // 仓库内部的文件：本程序不做"移动"，直接按原位置暂存。
+            // 指定了目标目录（拖到某个目录节点上）却没生效的话，必须说明，否则
+            // 用户看到的是"拖了但什么也没发生"
+            const QString origin = root.relativeFilePath(fi.absoluteFilePath());
+            if (origin == QLatin1String(".git") || origin.startsWith(".git/") || origin.isEmpty()) {
+                skipped << fi.fileName();
+                return;
+            }
+            if (!baseRel.isEmpty() && root.filePath(origin) != root.filePath(relInBase)) {
+                moved << fi.fileName();
+                return;
+            }
+            rel = origin;
         } else {
-            const QString dest = root.filePath(fi.fileName());
-            if (QFileInfo::exists(dest)) { skipped << fi.fileName(); continue; }
-            if (!QFile::copy(f, dest)) { skipped << fi.fileName(); continue; }
-            rel = fi.fileName();
+            const QString relDst = withBase(relInBase);
+            // 拖入的文件夹可能自带 .git（如整个 clone 目录），其内部文件不进仓库
+            if (relDst == QLatin1String(".git") || relDst.contains("/.git/")
+                || relDst.startsWith(".git/")) {
+                skipped << fi.fileName();
+                return;
+            }
+            const QString dest = root.filePath(relDst);
+            if (QFile::exists(dest)) {
+                // 同名文件：整次拖拽只问一次。第一次的选择（替换或跳过）就是本次
+                // 全部同名文件的处理方式，后面不再逐个打扰
+                // 进度窗是 ApplicationModal，同名询问挂到它下面，模态链才正常
+                if (mode == DropReplace::Ask)
+                    mode = askReplace(prog ? static_cast<QWidget *>(prog.get()) : this, relDst);
+                if (mode == DropReplace::No) {
+                    skipped << fi.fileName();
+                    return;
+                }
+            }
+            if (!replaceOrCopyFile(absSrc, dest)) { skipped << fi.fileName(); return; }
+            rel = relDst;
         }
         if (!rel.isEmpty() && rel != ".") staged << rel;
+    };
+
+    // ── ③ 按计划逐项落地，同步更新进度；用户取消就停下（已复制的仍然暂存，
+    //    避免留下"文件已落盘但没进暂存区"的中间状态）。
+    //    plan 里已经包含"直接拖入的文件"和"文件夹里的全部内容"，这里只走一遍 ──
+    // 定位优先落在拖入的文件夹本身，这样能看到整个文件夹；
+    // 没有文件夹（只拖了文件）时用循环里第一个成功导入的文件
+    QString revealWanted;
+    for (const QString &d : dirs) {
+        if (!revealWanted.isEmpty()) break;
+        revealWanted = withBase(QFileInfo(d).fileName());
     }
+
+    int done = 0;
+    // 没有进度窗时（小批量）用等待光标表示"正在干活"，别让窗口看起来像卡死了
+    if (!prog) QApplication::setOverrideCursor(Qt::WaitCursor);
+    for (const Plan &item : plan) {
+        if (prog) {
+            if (prog->wasCanceled()) break;
+            prog->setValue(done);
+            prog->setLabelText(QFileInfo(item.src).fileName());
+            ++done;
+        }
+        const int before = staged.size();
+        handleFile(item.src, item.relInBase);
+        if (staged.size() > before && revealWanted.isEmpty()) revealWanted = staged.last();
+    }
+    if (!prog) QApplication::restoreOverrideCursor();
+    if (prog) prog->close();
+    if (!revealWanted.isEmpty()) m_revealPath = revealWanted;
+
     if (staged.isEmpty()) {
         m_statusLabel->setText("⚠ " + i18n::t("dropped_none"));
         return;
     }
     try {
         git()->add(m_currentFile, staged);
+        markDirsExpanded(baseRel);
         refreshStatus();
         QString msg = i18n::t("dropped_staged").arg(staged.size());
         if (!skipped.isEmpty())
             msg += QStringLiteral("  (%1: %2)").arg(i18n::t("dropped_skipped"),
                                                     skipped.join(", "));
+        if (!moved.isEmpty())
+            msg += QStringLiteral("  (%1: %2)").arg(i18n::t("drop_move_unsupported"),
+                                                    moved.join(", "));
         m_statusLabel->setText("✅ " + msg);
     } catch (const std::exception &ex) {
         QMessageBox::critical(this, i18n::t("error"), ex.what());
@@ -1665,6 +2578,7 @@ void MainWindow::expandDirLazy(QTreeWidgetItem *item) {
                     && m_expandedDirs.contains(c->data(0, Qt::UserRole).toString()))
                 c->setExpanded(true);
         }
+        revealPendingItem();   // 这一层加载完，刚建的文件可能已经可以定位了
     });
     w->setFuture(QtConcurrent::run([abs]() -> QFileInfoList {
         return QDir(abs).entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot,
@@ -1711,17 +2625,32 @@ void MainWindow::showGlobalSearch() {
     v->addWidget(input);
     auto *list = new QListWidget;
     v->addWidget(list, 1);
-    connect(input, &QLineEdit::returnPressed, &d, [this, input, list] {
+    connect(input, &QLineEdit::returnPressed, &d, [this, input, list, &d] {
         list->clear();
         const QString q = input->text().trimmed();
         if (q.isEmpty()) return;
-        try {
-            const QString out = git()->run({ "grep", "-n", "-I", q }, m_currentFile, false);
-            for (const QString &l : out.split('\n', Qt::SkipEmptyParts)) list->addItem(l);
-            if (list->count() == 0) list->addItem(i18n::t("no_results"));
-        } catch (const std::exception &e) {
-            list->addItem(QString::fromUtf8(e.what()));
-        }
+        // git grep 在大仓库上要跑好几秒：放后台线程，别把界面冻住
+        list->addItem(i18n::t("searching"));
+        input->setEnabled(false);
+        const QString repo = m_currentFile;
+        auto *w = new QFutureWatcher<QStringList>(&d);   // 挂在对话框上，随它一起销毁
+        connect(w, &QFutureWatcher<QStringList>::finished, &d, [list, input, w] {
+            w->deleteLater();
+            input->setEnabled(true);
+            list->clear();
+            const QStringList out = w->result();          // 工作函数已兜住异常
+            if (out.isEmpty()) list->addItem(i18n::t("no_results"));
+            else list->addItems(out);
+        });
+        w->setFuture(QtConcurrent::run([repo, q]() -> QStringList {
+            try {
+                // -e 必须加：否则以 "-" 开头的搜索词会被 git 当成选项（unknown switch）
+                const QString out = git()->run({ "grep", "-n", "-I", "-e", q }, repo, false);
+                return out.split('\n', Qt::SkipEmptyParts);
+            } catch (const std::exception &e) {
+                return { QString::fromUtf8(e.what()) };
+            }
+        }));
     });
     connect(list, &QListWidget::itemDoubleClicked, &d, [this, list, &d](QListWidgetItem *it) {
         onFileDoubleClicked(it->text().section(':', 0, 0));
@@ -1740,9 +2669,14 @@ void MainWindow::openSettingsDialog() {
     connect(&dlg, &SettingsDialog::accountsChanged, this, &MainWindow::updateConnectTitle);
     connect(&dlg, &SettingsDialog::themeChanged, this, [this](const QString &t) {
         theme::setTheme(t);
-        theme::applyToApp();
+        theme::applyToApp();   // 全局 QSS + 调色板
+        // 以下几处是构造时设的内联样式，全局 QSS 管不到，必须逐个重刷，
+        // 否则切主题后 Diff/分支图/终端会停留在旧配色
         m_titleBar->applyTheme();
         m_editorPanel->applyTheme();
+        m_diffEdit->setStyleSheet(monoReadOnlyQss("QPlainTextEdit"));
+        m_graphEdit->setStyleSheet(monoReadOnlyQss("QTextEdit"));
+        if (m_terminal) m_terminal->applyTheme();
         m_imageView->setStyleSheet(QString("background-color:%1;").arg(theme::bg()));
     });
     connect(&dlg, &SettingsDialog::languageChanged, this, &MainWindow::retranslateUi);
@@ -1801,21 +2735,9 @@ void MainWindow::showManual() {
 }
 
 void MainWindow::showAbout() {
-    QDialog d(this);
-    d.setWindowTitle(i18n::t("about_title"));
-    d.setMinimumSize(720, 640);
-    auto *layout = new QVBoxLayout(&d);
-    auto *lbl = new QLabel(QStringLiteral(
-        "<h1>GitFlow</h1><p>%1</p><p>%2</p>"
-        "<p><a href='https://github.com/mosunand/GitFlow'>github.com/mosunand/GitFlow</a><br>"
-        "<a href='mailto:moshuai1013@outlook.com'>moshuai1013@outlook.com</a></p>")
-        .arg(tr("C++ / Qt implementation"), tr("Author: mosunand")));
-    lbl->setOpenExternalLinks(true);
-    layout->addWidget(lbl);
-    auto *closeBtn = new QPushButton(i18n::t("close"));
-    connect(closeBtn, &QPushButton::clicked, &d, &QDialog::accept);
-    layout->addWidget(closeBtn);
-    d.exec();
+    // 复用 AboutDialog：内联版只有两行英文占位文案，功能说明/技术栈/作者全丢失
+    AboutDialog dlg(this);
+    dlg.exec();
 }
 
 void MainWindow::retranslateUi() {
@@ -1850,20 +2772,22 @@ void MainWindow::retranslateUi() {
     m_runBtn->setToolTip(i18n::t("run_code"));
     m_addFileBtn->setText("+ " + i18n::t("add_file"));
     m_newFileBtn->setText("+ " + i18n::t("new_file"));
+    m_newFolderBtn->setText("+ " + i18n::t("new_folder"));
     m_newBranchBtn->setText("+ " + i18n::t("new_branch"));
     m_commitBtn->setText(i18n::t("commit_btn"));
     m_commitPushBtn->setText(i18n::t("commit_push_btn"));
     m_commitInput->setPlaceholderText(i18n::t("commit_placeholder"));
     m_changesTitle->setText("  \U0001F4DD " + i18n::t("changes"));
     m_changeTree->setHeaderLabels({ i18n::t("file"), i18n::t("status_col") });
-    m_detailTabs->setTabText(0, i18n::t("editor"));
+    // 页签可被关闭/移位，只能用 indexOf 定位；写死下标会改错页签或越界告警
+    if (m_detailTabs->indexOf(m_editorHost) >= 0)
+        m_detailTabs->setTabText(m_detailTabs->indexOf(m_editorHost), i18n::t("editor"));
     if (m_detailTabs->indexOf(m_diffEdit) >= 0)
         m_detailTabs->setTabText(m_detailTabs->indexOf(m_diffEdit), "Diff");
     if (m_detailTabs->indexOf(m_historyGroup) >= 0)
         m_detailTabs->setTabText(m_detailTabs->indexOf(m_historyGroup), i18n::t("history"));
     if (m_detailTabs->indexOf(m_graphEdit) >= 0)
         m_detailTabs->setTabText(m_detailTabs->indexOf(m_graphEdit), i18n::t("tab_graph"));
-    m_detailTabs->setTabText(3, i18n::t("tab_graph"));
     m_historyGroup->setTitle(i18n::t("commit_history"));
     if (m_repoNameLabel->text().startsWith("\U0001F4C1") == false)
         m_repoNameLabel->setText(i18n::t("no_project"));

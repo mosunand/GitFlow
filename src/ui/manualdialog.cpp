@@ -40,7 +40,7 @@ QString styleTag() {
 QString htmlBody() {
     // 使用 QStringLiteral 直接拼 HTML，内容即说明书
     const QString s =
-    "<h1>\U0001F680 GitFlow <span class='muted'>v1.0.0</span></h1>"
+    "<h1>\U0001F680 GitFlow <span class='muted'>v4.0.0</span></h1>"
     "<p style='color:%1;'>一款以 <b>GitHub / Gitee</b> 为核心的跨平台桌面 Git 客户端。"
     "用 C++ + Qt 6 实现，体积小、启动快，把日常 Git 操作、代码编辑、仓库管理和发布流程"
     "整合到一个窗口里。</p>"

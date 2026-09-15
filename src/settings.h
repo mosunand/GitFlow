@@ -16,9 +16,9 @@ void setStorageRoot(const QString &v);
 QString theme();                 // "dark"/"light"
 void setTheme(const QString &v);
 
-QString language();
-int editorFontSize();
-void setEditorFontSize(int v);              // "zh"/"en"
+QString language();                          // "zh"/"en"
+int editorFontSize();                        // 10~16，非法值回落 12
+void setEditorFontSize(int v);
 void setLanguage(const QString &v);
 
 QString lastProject();

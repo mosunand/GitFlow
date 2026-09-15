@@ -267,7 +267,8 @@ EditorPanel::EditorPanel(const QString &text, QWidget *parent) : QWidget(parent)
     connect(m_editor, &CodeEditor::zoomRequested, this, [this](int delta) {
         setEditorFontPointSize(m_editor->font().pointSize() + (delta > 0 ? 1 : -1));
     });
-    setEditorFontPointSize(12);   // 每次启动都从默认 12pt 开始
+    // 沿用上次记住的字号（settings::editorFontSize 已做合法区间兜底）
+    setEditorFontPointSize(settings::editorFontSize(), false);
     // 字体/字号/制表位/QSS 统一由 setEditorFontPointSize 设置
     connect(m_editor, &CodeEditor::findRequested, this, [this] {
         const QTextCursor c = m_editor->textCursor();
@@ -283,24 +284,32 @@ EditorPanel::EditorPanel(const QString &text, QWidget *parent) : QWidget(parent)
     m_editor->setPlainText(text);
     m_highlighter = new Highlighter(m_editor->document());
 
-    connect(m_findInput, &QLineEdit::textChanged, this, [this](const QString &text) {
-        m_cursors.clear();
-        m_current = -1;
-        if (!text.isEmpty()) {
-            QTextCursor c = m_editor->document()->find(text, 0);
-            while (!c.isNull()) {
-                m_cursors.append(c);
-                c = m_editor->document()->find(text, c);
-            }
-            if (!m_cursors.isEmpty()) m_current = 0;
-        }
-        if (m_cursors.isEmpty())
-            m_countLabel->setText(text.isEmpty() ? QString() : i18n::t("no_results"));
-        else {
-            m_countLabel->setText(QString("%1/%2").arg(m_current + 1).arg(m_cursors.size()));
-            m_editor->setTextCursor(m_cursors[m_current]);
-        }
+    connect(m_findInput, &QLineEdit::textChanged, this, [this] { recountFind(); });
+    // 文档内容变了，"x/y" 计数也要跟着变：只在查找栏可见时重算，避免平时打字也全篇扫描
+    connect(m_editor, &QPlainTextEdit::textChanged, this, [this] {
+        if (!m_findBar->isHidden() && !m_findInput->text().isEmpty()) recountFind();
     });
+}
+
+// 按当前查找词重算全部匹配并刷新计数（查找词变化与文档编辑共用）
+void EditorPanel::recountFind() {
+    const QString text = m_findInput->text();
+    m_cursors.clear();
+    m_current = -1;
+    if (!text.isEmpty()) {
+        QTextCursor c = m_editor->document()->find(text, 0);
+        while (!c.isNull()) {
+            m_cursors.append(c);
+            c = m_editor->document()->find(text, c);
+        }
+        if (!m_cursors.isEmpty()) m_current = 0;
+    }
+    if (m_cursors.isEmpty())
+        m_countLabel->setText(text.isEmpty() ? QString() : i18n::t("no_results"));
+    else {
+        m_countLabel->setText(QString("%1/%2").arg(m_current + 1).arg(m_cursors.size()));
+        m_editor->setTextCursor(m_cursors[m_current]);
+    }
 }
 
 QString EditorPanel::text() const { return m_editor->toPlainText(); }
@@ -312,7 +321,7 @@ void EditorPanel::setPlainText(const QString &t) {
     m_editor->setPlainText(t);
 }
 
-void EditorPanel::setEditorFontPointSize(int pt) {
+void EditorPanel::setEditorFontPointSize(int pt, bool notify) {
     pt = qBound(10, pt, 16);   // 范围 10~16pt
     QFont f(QStringLiteral("Consolas"), pt);
     m_editor->setFont(f);
@@ -323,6 +332,9 @@ void EditorPanel::setEditorFontPointSize(int pt) {
         .arg(theme::bg(), theme::text(), theme::selection()).arg(pt));
     m_editor->setTabStopDistance(m_editor->fontMetrics().horizontalAdvance(QLatin1Char(' ')) * 4);
     m_editor->refreshCurrentLine();
+    // 只有用户主动缩放才提示 + 落盘；否则每打开一个文件都会闪一次"12 pt"
+    if (!notify) return;
+    settings::setEditorFontSize(pt);
     if (m_zoomToast) {
         m_zoomToast->setText(QStringLiteral("%1 pt").arg(pt));
         m_zoomToast->adjustSize();

@@ -37,12 +37,14 @@ void GiteeService::forkRepo(const QString &owner, const QString &repo, const Cal
 
 void GiteeService::createRepo(const QString &name, const QString &desc, bool privateRepo,
                               bool autoInit, const Callback &cb) {
-    QJsonObject body;
-    body.insert("name", name);
-    body.insert("description", desc);
-    body.insert("private", privateRepo);
-    body.insert("auto_init", autoInit);
-    RestService::post("/user/repos", body, cb);
+    // 表单参数而不是 JSON：本项目在 createRelease 上实测过 Gitee v5 不解析 JSON body
+    //（官方 Swagger 也是表单），建仓走同一协议才稳妥
+    QUrlQuery form;
+    form.addQueryItem("name", name);
+    form.addQueryItem("description", desc);
+    form.addQueryItem("private", privateRepo ? QStringLiteral("true") : QStringLiteral("false"));
+    form.addQueryItem("auto_init", autoInit ? QStringLiteral("true") : QStringLiteral("false"));
+    RestService::postForm("/user/repos", form, cb);
 }
 
 void GiteeService::createRelease(const QString &owner, const QString &repo, const QString &tag,
@@ -81,9 +83,24 @@ void GiteeService::uploadAsset(const QString &owner, const QString &repo, qint64
     filePart.setHeader(QNetworkRequest::ContentTypeHeader,
                        QVariant(QStringLiteral("application/octet-stream")));
     auto *payload = new QFile(filePath);
-    payload->open(QIODevice::ReadOnly);
+    if (!payload->open(QIODevice::ReadOnly)) {
+        // 打开失败时必须回收：否则 multipart 变成一个空 part 发出去，
+        // 用户只会看到"附件上传失败"而不知道原因
+        delete payload;
+        delete multi;
+        cb(false, QJsonArray{}, QJsonObject{}, QStringLiteral("cannot open %1").arg(filePath));
+        return;
+    }
     filePart.setBodyDevice(payload);
     payload->setParent(multi);   // 随 multiPart 一起释放
     multi->append(filePart);
     RestService::postMultipart(url, multi, cb);
+}
+
+// 删除仓库。Gitee v5 的删除接口把 access_token 作为参数（和创建 Release 一样，
+// 表单/参数形式最稳），这里显式带上，避免只靠 Header 时 401
+void GiteeService::deleteRepo(const QString &owner, const QString &repo, const Callback &cb) {
+    QUrlQuery q;
+    q.addQueryItem("access_token", m_token);
+    RestService::remove(QStringLiteral("/repos/%1/%2").arg(owner, repo), cb, q);
 }

@@ -19,4 +19,6 @@ public:
                        const Callback &cb, const QString &targetCommitish = {});
     void uploadAsset(const QString &owner, const QString &repo, qint64 releaseId,
                      const QString &filePath, const Callback &cb);
+    // 删除远程仓库（不可逆；Gitee 的删除接口要求 access_token 走参数）
+    void deleteRepo(const QString &owner, const QString &repo, const Callback &cb);
 };

@@ -38,7 +38,12 @@ QString theme() { return get("theme", "light"); }
 void setTheme(const QString &v) { set("theme", v); }
 
 QString language() { return get("language", "zh"); }
-int editorFontSize() { return get("editor_font_size", "12").toInt(); }
+int editorFontSize() {
+    // 存的值可能被手改坏：非法值一律回落 12，否则编辑器会被 qBound 压到 10pt
+    bool ok = false;
+    const int v = get("editor_font_size", "12").toInt(&ok);
+    return (ok && v >= 10 && v <= 16) ? v : 12;
+}
 void setEditorFontSize(int v) { set("editor_font_size", QString::number(v)); }
 void setLanguage(const QString &v) { set("language", v); }
 

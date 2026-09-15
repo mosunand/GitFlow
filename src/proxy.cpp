@@ -2,6 +2,7 @@
 #include <QNetworkProxy>
 #include <QElapsedTimer>
 #include <QSocketNotifier>
+#include <QMutex>
 #include <WinSock2.h>
 #include <Ws2tcpip.h>
 #include <windows.h>
@@ -12,7 +13,7 @@ namespace {
 
 QString normalize(const QString &hp) {
     QString s = hp.trimmed();
-    if (s.endsWith('/')) s.chop(1);
+    while (s.endsWith('/')) s.chop(1);   // 可能连着多个尾斜杠
     if (!s.contains(QLatin1String("://")))
         s.prepend(QLatin1String("http://"));
     return s;
@@ -107,9 +108,13 @@ QString detectImpl() {
 bool hasProxy() { return !detectSystemProxy().isEmpty(); }
 
 QString detectSystemProxy() {
-    // TTL 缓存：避免每次 new RestService 都同步扫端口卡住 UI
+    // TTL 缓存：避免每次 new RestService 都同步扫端口卡住 UI。
+    // 必须加锁：git 调用都跑在工作线程上（刷新/推送扫描/提交闸门），
+    // 两个线程同时首次进来会并发写同一个 QString，属于会崩的竞态
     static QString cached;
     static QElapsedTimer last;
+    static QMutex mutex;
+    QMutexLocker lock(&mutex);
     if (last.isValid() && last.elapsed() < 60000) return cached;
     cached = detectImpl();
     last.restart();

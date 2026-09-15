@@ -18,6 +18,7 @@ public:
     void setBranch(const QString &branch);  // 分支变化时同步提示符
     void runCommandText(const QString &cmd); // 外部注入命令执行（编辑器"运行"）
     void retranslate();                      // 语言切换后刷新占位文案
+    void applyTheme();                       // 主题切换后重建内联样式
 
 private slots:
     void runCommand();

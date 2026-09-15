@@ -111,7 +111,7 @@ const Entry kTable[] = {
     {"delete_failed", "删除失败", "Delete Failed"},
     {"confirm_delete", "确认删除", "Confirm Delete"},
     {"new_file_title", "新建文件", "New File"},
-    {"file_name_label", "文件名（含扩展名）", "File name (with extension)"},
+    {"file_name_label", "文件名（含扩展名）· 创建在 %1/", "File name (with extension) · created in %1/"},
     {"file_exists", "文件已存在", "File Already Exists"},
     {"file_exists_body", "已存在于仓库中。", "already exists."},
     {"create_failed", "创建失败", "Create Failed"},
@@ -157,18 +157,88 @@ const Entry kTable[] = {
     {"token_expired", "Token 已过期，请重新添加账户", "Token expired. Please re-add the account"},
     {"token_expires_in", "Token 还有 %1 天过期", "Token expires in %1 days"},
     {"release_bad_request", "服务器拒绝了请求：通常是该 Tag 已存在发布、或标签/标题不符合平台要求，请换一个版本号重试。", "Server rejected the request: the tag likely already has a release, or the tag/title is invalid. Try another version."},
-    {"drag_drop_hint", "松开鼠标：文件夹=打开项目，文件=添加并暂存", "Drop: folder = open project, files = add & stage"},
+    {"drag_drop_hint", "松开鼠标：文件夹=打开项目，文件=添加并暂存；拖到左侧文件树的目录上=放进该目录", "Drop: folder = open project, files = add & stage; drop onto a folder in the file tree = put it inside that folder"},
     {"dropped_staged", "已暂存 %1 个文件——填写提交信息后点击 提交 / 提交并推送", "%1 file(s) staged — write a message, then Commit / Commit & Push"},
     {"dropped_skipped", "同名跳过", "skipped"},
+    {"drop_move_unsupported", "仓库内移动暂不支持，已跳过", "moving inside the repo is not supported yet, skipped"},
+    {"drop_target_hint", "松开后将放入：%1", "Will be placed in: %1"},
+    {"import_title", "导入文件", "Import Files"},
+    {"importing", "正在导入 %1 个文件...", "Importing %1 file(s)..."},
+    {"import_scanning", "正在扫描要导入的文件...", "Scanning files to import..."},
     {"dropped_none", "没有可添加的文件（同名文件已存在）", "Nothing to add (same-name files already exist)"},
+    {"drop_replace_title", "替换文件", "Replace File"},
+    {"drop_replace_msg", "仓库中已存在 <b>%1</b>。用拖入的文件替换它吗？\n（本次拖入的其余同名文件都按这个选择处理；替换后需提交才会生效，可用 git 恢复）", "<b>%1</b> already exists in the repository. Replace it with the dropped file?\n(The same choice applies to all other same-name files in this drop; commit to take effect, git can restore it)"},
+    {"drop_replace_yes", "替换", "Replace"},
+    {"drop_replace_no", "跳过", "Skip"},
     {"assets_tip", "支持拖入文件或整个文件夹；附件走 API 直传，不受 git 推送 100MB 限制（平台单附件上限：Gitee 100MB / GitHub 2GB）", "Drag files or folders here; assets upload via API, not limited by git's 100MB push cap (per-file: Gitee 100MB / GitHub 2GB)"},
+    {"oversized_cur_group", "① 工作区现存（删除文件即可解决）", "1) In working tree (delete the file to fix)"},
+    {"oversized_cur_hint", "→ 在文件树/变更列表中删除这些文件并提交，再推送。", "→ Delete these files and commit, then push."},
+    {"oversized_hist_group", "② 已写入提交历史（普通删除无效！）", "2) Already in commit history (deleting won't help!)"},
+    {"oversized_hist_hint", "→ 这些文件存在于历史提交中，平台会拒收。需重写历史将其移除，或选择仍要推送（会失败）。", "→ These exist in past commits; the platform will reject them. Rewrite history to remove them, or push anyway (will fail)."},
+    {"oversized_purge_btn", "重写历史清除大文件", "Rewrite history to remove"},
+    {"oversized_soft_btn", "回退重提交（推荐，秒级）", "Soft reset & recommit (recommended, instant)"},
+    {"oversized_soft_confirm", "将回退到大文件进入之前的提交，之后的改动会合并为一个新提交（大文件自动剔除）。\n不改动更早的历史，无需强制推送。继续吗？", "This resets to just before the big file entered, then re-packs later changes into one new commit (big files excluded).\nEarlier history is untouched; no force push needed. Continue?"},
+    {"oversized_purge_confirm", "<b style='color:#e5534b;'>⚠ 即将重写当前分支的提交历史以移除：%1</b><br><br>• 本分支所有提交哈希都会改变<br>• <b>不可撤销</b><br>• 若本分支已推送过远程，重写后需强制推送（force push），他人副本会分叉<br><br>确定继续吗？", "<b style='color:#e5534b;'>⚠ About to rewrite this branch's commit history to remove: %1</b><br><br>• All commit hashes on this branch will change<br>• <b>Cannot be undone</b><br>• If this branch was pushed, you'll need a force push; others' copies will diverge<br><br>Continue?"},
+    {"oversized_purge_incomplete", "部分大文件仍留在历史中（可能被改名、或同一份内容存在多个路径），未能彻底清除。建议改用 git filter-repo 等命令行工具处理。", "Some large files are still in history (renamed, or duplicated under several paths) and were not fully removed. Use a command-line tool such as git filter-repo instead."},
+    {"oversized_checking", "正在检查大文件...", "Checking for oversized files..."},
+    {"commit_blocked_title", "提交被阻止", "Commit Blocked"},
+    {"commit_blocked_body", "以下文件超过 100MB（GitHub / Gitee 单文件上限），已被阻止进入本次提交：", "These files exceed 100MB (GitHub/Gitee per-file limit) and were blocked from this commit:"},
+    {"commit_blocked_hint", "请删除这些文件、把它们加入 .gitignore、或改用 Git LFS 后再提交。", "Delete them, add them to .gitignore, or switch to Git LFS, then commit again."},
+    {"delete_repo_btn", "删除仓库", "Delete Repository"},
+    {"delete_repo_title", "删除仓库", "Delete Repository"},
+    {"delete_repo_confirm", "<b style='color:#e5534b;'>⚠ 即将永久删除远程仓库 %1</b><br><br>• 仓库及其下的全部提交、Issue、Release 都会被删除<br>• <b>不可撤销</b>，也无法从本程序恢复<br>• 本地副本不会被删除<br><br>确定要继续吗？", "<b style='color:#e5534b;'>⚠ About to permanently delete the remote repository %1</b><br><br>• All commits, issues and releases in it will be deleted<br>• <b>Cannot be undone</b> and cannot be restored from this app<br>• Your local copy will not be deleted<br><br>Continue?"},
+    {"delete_repo_confirm_btn", "永久删除", "Delete Permanently"},
+    {"delete_repo_not_empty", "%1 里还有文件，不能删除仓库。\n\n请先在左侧文件树里删除全部文件，提交并推送（让远程也清空），再回来删除仓库。\n\n本地副本：%2", "%1 still contains files, so the repository cannot be deleted.\n\nDelete every file in the file tree, commit and push (so the remote becomes empty too), then delete the repository.\n\nLocal copy: %2"},
+    {"delete_repo_not_empty_short", "仓库不为空，请先在文件树里清空并推送", "Repository is not empty — clear files in the file tree and push first"},
+    {"delete_repo_remote_not_empty", "远程仓库 %1 仍有内容，不能删除。\n\n请先克隆到本地，在文件树里清空并推送，使远程变空后再删除。", "The remote repository %1 still has content and cannot be deleted.\n\nClone it locally first, clear the files in the file tree and push, so the remote becomes empty, then delete it."},
+    {"delete_repo_checking", "正在检查仓库内容...", "Checking repository contents..."},
+    {"delete_repo_unverified", "无法确认 %1 是否已清空，未执行删除。\n\n请先把它克隆到本地，在文件树里确认清空并推送后再删除。\n\n（查询失败原因：%2）", "Could not confirm whether %1 is empty, so it was not deleted.\n\nClone it locally first, verify it is cleared in the file tree and push, then delete it.\n\n(Reason: %2)"},
+    {"delete_repo_doing", "正在删除仓库...", "Deleting repository..."},
+    {"delete_repo_done", "已删除仓库 %1", "Repository %1 deleted"},
+    {"delete_repo_failed", "删除失败", "Delete Failed"},
+    {"delete_repo_need_scope", "Token 权限不足。删除仓库是独立权限：GitHub 需勾选 delete_repo，Gitee 需 projects 权限。请重新生成 Token，并在 设置 → 连接用户 中更新该账户。", "Token permission denied. Deleting a repository needs a separate scope: delete_repo on GitHub, projects on Gitee. Regenerate the token and update the account in Settings → Connect."},
+    // 仓库列表行尾的"最后修改时间"
+    {"time_just_now", "刚刚", "just now"},
+    {"time_minutes_ago", "%1 分钟前", "%1 min ago"},
+    {"time_hours_ago", "%1 小时前", "%1 hours ago"},
+    {"time_days_ago", "%1 天前", "%1 days ago"},
+    {"time_months_ago", "%1 个月前", "%1 months ago"},
+    {"time_years_ago", "%1 年前", "%1 years ago"},
+    {"repo_updated_at", "最后修改：%1", "Last modified: %1"},
+    // 新建文件夹（Git 不跟踪空文件夹，需 .gitkeep 占位）
+    {"new_folder", "新建文件夹", "New Folder"},
+    {"new_folder_title", "新建文件夹", "New Folder"},
+    {"folder_name_label", "文件夹名（含子目录，如 src/utils）· 创建在 %1/", "Folder name (subpaths allowed, e.g. src/utils) · created in %1/"},
+    {"empty_folder_hint", "文件夹已创建。\n\nGit 只跟踪文件，空文件夹不会出现在变更列表里，也不会被提交/推送。是否在其中创建一个 .gitkeep 占位文件，让它能被提交？", "Folder created.\n\nGit tracks files, not empty folders — an empty folder will not appear in the change list and cannot be committed/pushed. Create a .gitkeep placeholder inside so it can be committed?"},
+    {"folder_keep_placeholder", "创建 .gitkeep", "Create .gitkeep"},
+    {"folder_keep_empty", "保持为空", "Keep Empty"},
+    {"folder_created", "已创建文件夹 %1", "Folder %1 created"},
+    {"path_outside_repo", "路径必须位于当前仓库内（不能填绝对路径）。", "The path must be inside the current repository (absolute paths are not allowed)."},
+    {"file_too_large", "文件过大", "File Too Large"},
+    {"save_failed_body", "无法写入 %1：\n%2\n\n原文件可能已被截断，请检查磁盘空间/文件权限，并及时用 git 恢复。", "Cannot write %1:\n%2\n\nThe file may have been truncated. Check disk space/permissions and restore it with git."},
+    {"file_too_large_body", "该文件 %1 MB，超出内置编辑器上限（20MB）。\n\n打开这种大小的文件会让界面卡住，且编辑器可直接写回，风险较高。请用其他编辑器查看。", "This file is %1 MB, over the built-in editor's 20MB limit.\n\nOpening it would freeze the UI, and the editor writes back directly, which is risky. Use another editor instead."},
+    {"oversized_purging", "正在重写历史清除大文件...", "Rewriting history to remove large files..."},
+    {"oversized_purged", "历史大文件已清除", "Large files removed from history"},
+    {"oversized_purge_failed", "历史清理失败", "History cleanup failed"},
+    {"asset_partial_fail", "Release 已创建，但附件上传中断（已传 %1/%2）：%3\n可打开发布页手动补传剩余附件。", "Release created, but asset upload stopped (%1/%2 done): %3\nOpen the release page to upload the rest manually."},
+    {"remote_ahead_msg", "远程仓库有 %1 个本地没有的新提交（可能来自网页端或其他设备），直接推送会被拒绝。\n\n推荐先变基整合到本地再推送。", "The remote has %1 new commit(s) not present locally (web edits or another device). Push would be rejected.\n\nRecommended: pull with rebase, then push."},
+    {"btn_rebase_push", "变基整合并推送（推荐）", "Rebase & Push (recommended)"},
+    {"rebase_failed", "变基失败（可能存在冲突）", "Rebase failed (possible conflicts)"},
+    {"rebase_abort_btn", "放弃变基（恢复原状）", "Abort rebase (restore)"},
+    {"rebase_abort_hint", "仓库目前停在变基中间状态：不放弃的话，之后的提交、切换分支都会失败。", "The repository is mid-rebase: without aborting, further commits and branch switches will fail."},
+    {"rebase_aborted", "已放弃变基，仓库恢复到变基前的状态。", "Rebase aborted; the repository is back to its pre-rebase state."},
+    {"stash_conflict", "弹出暂存时发生冲突", "Stash pop ran into conflicts"},
+    {"stash_nothing", "没有需要暂存的修改", "Nothing to stash"},
+    {"dropped_staged_short", "已暂存", "staged"},
+    {"img_too_large_body", "图片尺寸 %1×%2（超过 1 亿像素），内置预览打不开，请用看图工具查看。", "The image is %1×%2 pixels (over 100 MP). The built-in preview cannot open it; use an image viewer."},
+    {"push_cancelled_by_user", "已取消推送", "Push cancelled"},
+    {"push_fetch_first", "推送被拒：远程包含本地没有的提交。请先执行 Git → 拉取 整合远程改动，再推送。", "Push rejected: the remote contains work you don't have. Pull (Git → Pull) first, then push."},
     {"author_current_hint", "当前 Git 全局身份：%1 &lt;%2&gt;（修改请填写下方并保存）", "Current global git identity: %1 <%2> (edit below and save to change)"},
     {"author_name_ph", "user.name，例如：张三", "user.name, e.g. Zhang San"},
     {"author_email_ph", "user.email，例如：you@example.com", "user.email, e.g. you@example.com"},
     {"save_author", "保存 Git 作者信息", "Save Git Author"},
     {"author_saved", "Git 提交作者信息已保存", "Git author saved"},
     {"author_empty", "user.name 和 user.email 都不能为空", "user.name and user.email are required"},
-    {"save_failed", "保存失败", "Save Failed"},
     {"platform", "平台", "Platform"},
     {"token_label", "Access Token", "Access Token"},
     {"token_ph", "粘贴你的 Token...", "Paste your token..."},
@@ -246,7 +316,6 @@ const Entry kTable[] = {
     {"tag_list_t", "标签列表", "Tag List"},
     {"no_tags", "当前仓库没有任何标签。", "No tags."},
     {"tag_del_hint", "双击可删除标签：", "Double-click to delete a tag:"},
-    {"tag_name", "标签名称：", "Tag name:"},
     {"tag_desc", "标签说明", "Tag Description"},
     {"tag_desc_ph", "说明（可选，留空则创建轻量标签）：", "Description (optional):"},
     {"tag_created", "标签已创建", "Tag Created"},
@@ -267,7 +336,6 @@ const Entry kTable[] = {
     {"branch_created", "已创建分支 %1", "Branch %1 created"},
     {"switch_failed", "切换失败", "Switch Failed"},
     {"switched_to", "已切换到 %1", "Switched to %1"},
-    {"create_failed", "创建失败", "Create Failed"},
     {"shortcut_title", "快捷键说明", "Keyboard Shortcuts"},
     {"about_title", "关于 GitFlow", "About GitFlow"},
     {"about_btn_repo", "⭐ 开源仓库", "⭐ Source Repo"},
@@ -282,7 +350,6 @@ const Entry kTable[] = {
     {"stage_final", "即将完成...", "Finalizing..."},
     {"git_author_body", "本机 Git 尚未配置提交作者（user.name / user.email），提交会失败。\n是否现在去设置？", "Git author not configured.\nSet it now?"},
     {"git_author_title", "未设置 Git 作者", "Git Author Not Set"},
-    {"pushing", "正在推送...", "Pushing..."},
     {"need_account", "请先在设置中添加账户。", "Add an account in Settings first."},
     {"confirm_revert_body", "确定要 revert 到以下提交吗？", "Revert to this commit?"},
     {"img_load_failed", "图片加载失败", "Failed to load image"},
@@ -327,6 +394,7 @@ const Entry kTable[] = {
     {"loading_repo", "正在加载仓库...", "Loading repository..."},
     {"truncated", "已截断", "truncated"},
     {"terminal_placeholder", "git status / ls / cd ..  (Enter 执行)", "git status / ls / cd ..  (Enter)"},
+    {"bash_not_found", "无法启动 %1（未找到 Git Bash？请在 设置 → Git 里指定 git.exe 路径）", "Cannot start %1 (Git Bash not found? Set the git.exe path in Settings → Git)"},
     {"proc_crashed", "进程异常退出", "process exited abnormally"},
     {"exit_code", "退出码 %1", "exit code %1"},
     {"undo", "撤销", "Undo"},
@@ -336,6 +404,30 @@ const Entry kTable[] = {
     {"paste", "粘贴", "Paste"},
     {"select_all", "全选", "Select All"},
     {"delete_sel", "删除", "Delete"},
+    // ── 以下为界面中实际引用但此前缺失的词条（缺失时会把 key 原样显示给用户）──
+    {"choose_git", "选择 git.exe", "Select git.exe"},
+    {"repo_name_label", "仓库名称", "Repository name"},
+    {"toolbar_name", "工具栏", "Toolbar"},
+    {"save", "保存", "Save"},
+    {"discard_btn", "放弃修改", "Discard"},
+    {"unsaved_switch_q", "当前文件有未保存的修改，打开其他文件会丢弃这些改动。", "The current file has unsaved changes; opening another file will discard them."},
+    {"discard_q", "确定放弃 %1 的修改吗？", "Discard changes to %1?"},
+    {"discard_untracked_q", "「%1」是未跟踪文件，没有可恢复的历史版本。放弃修改等于删除该文件，确定吗？",
+     "「%1」 is untracked and has no committed version to restore. Discarding means deleting it. Continue?"},
+    {"git_not_found", "未找到可用的 git，请到 设置 → Git 指定 git.exe 路径。", "No usable git found. Set the git.exe path in Settings → Git."},
+    {"sc_open", "打开项目", "Open project"},
+    {"sc_save", "保存当前文件", "Save current file"},
+    {"sc_find", "在编辑器中查找", "Find in editor"},
+    {"sc_quit", "退出程序", "Quit"},
+    {"sc_findbar", "查找栏内：", "In the find bar:"},
+    {"sc_next", "下一个匹配", "Next match"},
+    {"sc_prev", "上一个匹配", "Previous match"},
+    {"sc_close_find", "关闭查找栏", "Close find bar"},
+    {"net_diag_title", "【网络诊断】", "[Network diagnostics]"},
+    {"net_diag_proxy", "已检测到系统代理：%1", "System proxy detected: %1"},
+    {"net_diag_direct", "未检测到系统代理，当前为直连。", "No system proxy detected; using a direct connection."},
+    {"net_diag_hint", "若浏览器能访问而这里失败，请检查代理软件是否在运行、是否只代理了浏览器。",
+     "If the browser works but this fails, check that your proxy app is running and is not browser-only."},
 };
 } // namespace
 
@@ -343,10 +435,19 @@ void setLang(const QString &lang) { g_lang = lang; }
 QString lang() { return g_lang; }
 
 QString t(const QString &key) {
-    for (const auto &e : kTable) {
-        if (key == QLatin1String(e.key))
-            return QString::fromUtf8(g_lang == "zh" ? e.zh : e.en);
-    }
-    return key;
+    // 建一次 key→下标 的哈希表：原实现每次调用都线性扫全表并逐条比较字符串，
+    // 而界面构造期 t() 会被调用数百次；查不到时仍原样返回 key，便于发现漏配
+    static const QHash<QString, int> index = [] {
+        QHash<QString, int> m;
+        const int n = int(sizeof(kTable) / sizeof(kTable[0]));
+        m.reserve(n);
+        for (int i = 0; i < n; ++i)
+            m.insert(QString::fromLatin1(kTable[i].key), i);
+        return m;
+    }();
+    const auto it = index.constFind(key);
+    if (it == index.constEnd()) return key;
+    const Entry &e = kTable[*it];
+    return QString::fromUtf8(g_lang == QLatin1String("zh") ? e.zh : e.en);
 }
 } // namespace i18n

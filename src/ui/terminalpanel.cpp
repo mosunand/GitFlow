@@ -81,6 +81,21 @@ void TerminalPanel::retranslate() {
     m_in->setPlaceholderText(i18n::t("terminal_placeholder"));
 }
 
+// 主题切换后重刷内联样式：构造函数里设过一次，不重刷就会停留在旧配色
+// （全局 QSS 管不到这些内联样式，只有这里主动重建）
+void TerminalPanel::applyTheme() {
+    m_out->setStyleSheet(QString(
+        "QPlainTextEdit{background-color:%1;color:%2;border:1px solid %3;border-radius:6px;"
+        "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
+        .arg(theme::bg(), theme::text(), theme::border()));
+    m_prompt->setStyleSheet(QStringLiteral("font-family:'Consolas','Courier New',monospace;"));
+    m_in->setStyleSheet(QString(
+        "QLineEdit{background-color:%1;color:%2;border:1px solid %3;border-radius:6px;padding:4px 8px;"
+        "font-family:'Consolas','Courier New',monospace;font-size:10pt;}")
+        .arg(theme::bg(), theme::text(), theme::border()));
+    updatePrompt();   // 提示符的 HTML 颜色同样来自主题
+}
+
 void TerminalPanel::setGitPath(const QString &gitPath) {
     // 由 git.exe 路径推回 Git 安装根，再找 bash.exe（cmd/git.exe → 根/bin/bash.exe）
     QDir d = QFileInfo(gitPath).absolutePath();
@@ -161,11 +176,16 @@ void TerminalPanel::runCommand() {
     }
     echoCommand(cmd);
     // 纯 cd 命令（不带引号组合：cd、cd ~、cd 路径）才走内置逻辑；
-    // 带 && 等 bash 组合（如代码运行的 cd xxx && g++ ...）交给 bash 执行
-    static const QRegularExpression isPlainCd("^cd(?:\\s+[^\\s&|;]+)?$");
+    // 带 && 等 bash 组合（如代码运行的 cd xxx && g++ ...）交给 bash 执行。
+    // 带空格的路径通常写作 cd "My Folder"，也必须识别，否则 m_cwd 会与真实目录脱节
+    static const QRegularExpression isPlainCd(
+        "^cd(?:\\s+(?:\"[^\"]*\"|'[^']*'|[^\\s&|;]+))?$");
     if (isPlainCd.match(cmd).hasMatch()) {
         QString target = cmd.mid(2).trimmed();
-        if (target.startsWith('"') && target.endsWith('"') && target.size() >= 2)
+        // 去掉成对引号：正则已允许 "..." 与 '...'，这里要对应剥掉，否则带空格的路径会 cd 失败
+        if (target.size() >= 2
+            && ((target.startsWith('"') && target.endsWith('"'))
+                || (target.startsWith('\'') && target.endsWith('\''))))
             target = target.mid(1, target.size() - 2);
         QDir d(m_cwd);
         if (target.isEmpty() || target == QLatin1String("~")) {
@@ -181,22 +201,43 @@ void TerminalPanel::runCommand() {
         return;
     }
 
-    if (m_proc) { m_proc->kill(); m_proc->deleteLater(); }
-    m_proc = new QProcess(this);
-    m_proc->setWorkingDirectory(m_cwd);
-    connect(m_proc, &QProcess::readyReadStandardOutput, this, &TerminalPanel::onOutput);
-    connect(m_proc, &QProcess::readyReadStandardError, this, &TerminalPanel::onOutput);
-    connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus st) {
+    // 上一条命令还没跑完就来了新命令：先把它掐掉。finished 是异步到达的，
+    // 必须先摘掉 m_proc 并断开旧进程的信号，否则旧进程的 finished 回调
+    // 会把刚创建的新进程指针清成 nullptr（新命令输出丢失且进程不再回收）
+    if (m_proc) {
+        auto *old = m_proc;
+        m_proc = nullptr;
+        disconnect(old, nullptr, this, nullptr);
+        old->kill();
+        old->deleteLater();
+    }
+    auto *proc = new QProcess(this);
+    m_proc = proc;
+    proc->setWorkingDirectory(m_cwd);
+    connect(proc, &QProcess::readyReadStandardOutput, this, &TerminalPanel::onOutput);
+    connect(proc, &QProcess::readyReadStandardError, this, &TerminalPanel::onOutput);
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError err) {
+        // 找不到 bash（未装 Git Bash / 路径推导失败）时 QProcess 只报错不报结果，
+        // 原先终端一片安静，用户完全不知道命令根本没执行
+        if (err != QProcess::FailedToStart) return;
+        appendOutput("[" + i18n::t("bash_not_found").arg(m_bashPath) + "]");
+        if (proc == m_proc) {
+            m_proc = nullptr;
+            proc->deleteLater();
+        }
+    });
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, proc](int code, QProcess::ExitStatus st) {
+        if (proc != m_proc) return;   // 已被新命令替换，避免误清空
         if (st == QProcess::CrashExit)
             appendOutput("[" + i18n::t("proc_crashed") + "]");
         else if (code != 0)
             appendOutput("[" + i18n::t("exit_code").arg(code) + "]");
-        m_proc->deleteLater();
         m_proc = nullptr;
+        proc->deleteLater();
     });
     // bash -c "<cmd>"：完整 bash 语义（管道/重定向/&&）
-    m_proc->start(m_bashPath, { "-c", cmd });
+    proc->start(m_bashPath, { "-c", cmd });
 }
 
 void TerminalPanel::onOutput() {

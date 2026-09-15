@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(GitFlowPro VERSION 1.0.0 LANGUAGES CXX)
+project(GitFlowPro VERSION 4.0.0 LANGUAGES CXX)
 # Windows 资源脚本（app.rc 内嵌应用图标）需要 RC 语言（MinGW 用 windres）
 enable_language(RC)
 

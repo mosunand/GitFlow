@@ -31,7 +31,6 @@ void setTheme(const QString &t) { g_theme = t; }
 QString theme() { return g_theme; }
 bool isDark() { return g_theme == "dark"; }
 
-#define GET(name) QString ret; do { ret = QString::fromLatin1(cur().name); } while(0); return ret
 QString bg()          { return cur().bg; }
 QString bgSurface()   { return cur().bgSurface; }
 QString bgElevated()  { return cur().bgElevated; }
@@ -89,8 +88,6 @@ QString globalQss() {
         "QTabBar::tab:selected { background: %2; color: %3; font-weight: bold; }"
         "QTabBar::tab:hover { background: %5; }"
         "QTabBar::tab:first { margin-left: 4px; }"
-        "QTabBar::close-button { image: url(:/icon/close_dot.png); subcontrol-position: right; }"
-        "QTabBar::close-button:hover { image: url(:/icon/close_dot_hover.png); }"
         "QTabBar::close-button { image: url(:/icon/close_dot.png); subcontrol-position: right; }"
         "QTabBar::close-button:hover { image: url(:/icon/close_dot_hover.png); }"
         "QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }"

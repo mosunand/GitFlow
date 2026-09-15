@@ -22,9 +22,11 @@ struct CommitInfo {
 };
 
 struct OversizedFile {
-    QString path, source;
+    QString path, source;   // source: "current"（工作区现存）/"history"（已进历史）/"pending"（即将进入本次提交）
     qint64 size = 0;
     double sizeMb = 0;
+    QString firstCommit;    // 历史文件首次进入的提交（空=工作区文件）；软回退方案的锚点
+    QString blobId;         // 历史文件的 blob 哈希：清理时按 blob 定位，避免改名/多路径漏删
 };
 
 // ── 账户（Token 加密存储）──

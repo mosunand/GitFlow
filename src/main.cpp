@@ -21,8 +21,9 @@ int main(int argc, char *argv[]) {
     QTranslator qtTr;
     if (i18n::lang() != QLatin1String("en")) {
         const QString dir = paths::appRoot() + "/translations";
+        // 翻译文件是可选的：两种命名都找不到时保持英文，不影响功能
         if (!qtTr.load(QStringLiteral("qtbase_%1.qm").arg(i18n::lang()), dir))
-            qtTr.load(QStringLiteral("qt_%1.qm").arg(i18n::lang()), dir);
+            (void)qtTr.load(QStringLiteral("qt_%1.qm").arg(i18n::lang()), dir);
     }
     app.installTranslator(&qtTr);
 
